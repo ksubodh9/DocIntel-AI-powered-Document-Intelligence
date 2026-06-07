@@ -9,7 +9,9 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     if (!supabaseConfigured) {
-      // No Supabase credentials — skip auth, show config screen
+      // No Supabase credentials — run as a single-user app with no auth required.
+      // Treat the session as a permanently-logged-in local user.
+      setUser({ id: "local", email: "local@pdf-agent.app" });
       setLoading(false);
       return;
     }
