@@ -5,10 +5,15 @@ Endpoints:
   POST   /upload                    Upload a PDF
   POST   /classify/{doc_id}         Classify the document
   POST   /summarize/{doc_id}        Generate summaries + topics
+  POST   /metadata/{doc_id}         Extract document metadata
+  GET    /tables/{doc_id}           Get extracted tables
   POST   /chat                      Chat with the document (RAG Q&A)
+  POST   /chat/multi                Chat across multiple documents
+  POST   /compare                   Compare two documents
   GET    /document/{doc_id}         Get full document details
   GET    /document/{doc_id}/history Get chat history
   GET    /questions/{doc_id}        Get suggested questions
+  GET    /documents                 List all ready documents
   DELETE /document/{doc_id}         Delete a document
 """
 
@@ -25,8 +30,15 @@ from app.schemas.document import (
     UploadResponse,
     ClassifyResponse,
     SummaryResponse,
+    MetadataResponse,
+    TablesResponse,
+    TableItem,
     ChatRequest,
+    MultiChatRequest,
     ChatResponse,
+    MultiChatResponse,
+    CompareRequest,
+    CompareResponse,
     DocumentDetail,
     ChatHistoryResponse,
     ChatHistoryItem,
@@ -131,7 +143,7 @@ def classify_document(
     try:
         doc = svc.classify_document(doc)
     except LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error during classification: {str(e)}")
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
 
     return ClassifyResponse(
         document_id=doc.id,
@@ -155,7 +167,7 @@ def summarize_document(
         if not doc.suggested_questions:
             doc = svc.generate_suggested_questions(doc)
     except LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error during summarization: {str(e)}")
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
 
     return SummaryResponse(
         document_id=doc.id,
@@ -180,7 +192,7 @@ def chat_with_document(
     try:
         result = svc.chat(doc, request.message, request.include_history)
     except LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error during chat: {str(e)}")
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
 
     citations = [Citation(**c) for c in result["citations"]]
     return ChatResponse(
@@ -238,6 +250,108 @@ def get_suggested_questions(
         document_id=doc.id,
         questions=doc.suggested_questions or [],
     )
+
+
+# ── Metadata ──────────────────────────────────────────────────────────────────
+
+@router.post("/metadata/{doc_id}", response_model=MetadataResponse)
+def extract_metadata(
+    doc_id: str,
+    svc: DocumentService = Depends(get_document_service),
+):
+    doc = _get_doc_or_404(doc_id, svc)
+    _require_ready(doc)
+    try:
+        doc = svc.extract_metadata(doc)
+    except LLMError as e:
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+    return MetadataResponse(document_id=doc.id, metadata=doc.doc_metadata or {})
+
+
+# ── Tables ────────────────────────────────────────────────────────────────────
+
+@router.get("/tables/{doc_id}", response_model=TablesResponse)
+def get_tables(
+    doc_id: str,
+    svc: DocumentService = Depends(get_document_service),
+):
+    doc = _get_doc_or_404(doc_id, svc)
+    _require_ready(doc)
+    raw_tables = doc.tables or []
+    tables = [TableItem(page=t["page"], caption=t["caption"], markdown=t["markdown"]) for t in raw_tables]
+    return TablesResponse(document_id=doc.id, table_count=len(tables), tables=tables)
+
+
+# ── Multi-document Chat ───────────────────────────────────────────────────────
+
+@router.post("/chat/multi", response_model=MultiChatResponse)
+def multi_chat(
+    request: MultiChatRequest,
+    svc: DocumentService = Depends(get_document_service),
+):
+    # Validate all documents exist and are ready
+    doc_map = {}
+    for doc_id in request.document_ids:
+        doc = svc.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+        if doc.status != "ready":
+            raise HTTPException(status_code=409, detail=f"Document '{doc_id}' is not ready (status: {doc.status}).")
+        doc_map[doc_id] = doc
+
+    try:
+        result = svc.chat_multi(request.document_ids, doc_map, request.message)
+    except LLMError as e:
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+
+    citations = [Citation(**c) for c in result["citations"]]
+    return MultiChatResponse(
+        document_ids=request.document_ids,
+        message_id=result["message_id"],
+        answer=result["answer"],
+        citations=citations,
+        sources_found=result["sources_found"],
+    )
+
+
+# ── Document Comparison ───────────────────────────────────────────────────────
+
+@router.post("/compare", response_model=CompareResponse)
+def compare_documents(
+    request: CompareRequest,
+    svc: DocumentService = Depends(get_document_service),
+):
+    doc_a = svc.get_document(request.document_id_a)
+    doc_b = svc.get_document(request.document_id_b)
+    if not doc_a:
+        raise HTTPException(status_code=404, detail=f"Document A '{request.document_id_a}' not found.")
+    if not doc_b:
+        raise HTTPException(status_code=404, detail=f"Document B '{request.document_id_b}' not found.")
+    if doc_a.status != "ready":
+        raise HTTPException(status_code=409, detail=f"Document A is not ready (status: {doc_a.status}).")
+    if doc_b.status != "ready":
+        raise HTTPException(status_code=409, detail=f"Document B is not ready (status: {doc_b.status}).")
+
+    try:
+        result = svc.compare_documents(doc_a, doc_b)
+    except LLMError as e:
+        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+
+    return CompareResponse(
+        document_id_a=request.document_id_a,
+        document_id_b=request.document_id_b,
+        **result,
+    )
+
+
+# ── List all documents ────────────────────────────────────────────────────────
+
+@router.get("/documents", response_model=list[DocumentDetail])
+def list_documents(
+    svc: DocumentService = Depends(get_document_service),
+):
+    docs = svc.get_all_ready_documents()
+    return [DocumentDetail.model_validate(d) for d in docs]
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────

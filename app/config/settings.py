@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # Storage
     upload_dir: Path = BASE_DIR / "data" / "uploads"
     vectorstore_dir: Path = BASE_DIR / "data" / "vectorstore"
-    database_url: str = f"sqlite:///{BASE_DIR}/data/pdf_agent.db"
+    database_url: str = f"sqlite:///{BASE_DIR.as_posix()}/data/pdf_agent.db"
 
     # File Limits
     max_file_size_mb: int = 50

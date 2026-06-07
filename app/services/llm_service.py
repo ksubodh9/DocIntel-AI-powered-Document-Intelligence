@@ -16,7 +16,70 @@ logger = logging.getLogger(__name__)
 
 
 class LLMError(Exception):
-    pass
+    """
+    User-facing LLM error with an optional retry_after hint (seconds).
+    The message is always clean and human-readable — never a raw API dump.
+    """
+    def __init__(self, message: str, retry_after: int = 0):
+        super().__init__(message)
+        self.retry_after = retry_after  # 0 = no hint
+
+
+def _classify_api_error(provider: str, exc: Exception) -> "LLMError":
+    """
+    Convert a raw SDK exception into a clean LLMError.
+    Logs the full technical detail at DEBUG level; only returns a short message.
+    """
+    raw = str(exc)
+    lower = raw.lower()
+
+    # ── Rate limit / quota ────────────────────────────────────────────────────
+    if any(k in raw for k in ("429", "RESOURCE_EXHAUSTED")) or \
+       any(k in lower for k in ("quota", "rate limit", "rate_limit", "too many requests")):
+        import re as _re
+        m = _re.search(r"retry[_ ](?:in|delay)[^\d]*(\d+\.?\d*)", raw, _re.IGNORECASE)
+        wait = int(float(m.group(1))) + 1 if m else 0
+        hint = f" Please wait {wait}s before retrying." if wait else " Please wait a moment before retrying."
+        logger.debug(f"[LLM] Raw rate-limit error from {provider}: {raw}")
+        return LLMError(f"Rate limit reached ({provider}).{hint}", retry_after=wait)
+
+    # ── Auth / API key ────────────────────────────────────────────────────────
+    if any(k in raw for k in ("401", "403")) or \
+       any(k in lower for k in ("api key", "api_key", "authentication", "unauthorized", "permission denied")):
+        logger.debug(f"[LLM] Raw auth error from {provider}: {raw}")
+        return LLMError(f"API key error ({provider}). Check {provider.upper()}_API_KEY in your .env file.")
+
+    # ── Model not found ───────────────────────────────────────────────────────
+    if "404" in raw or ("not found" in lower and "model" in lower):
+        logger.debug(f"[LLM] Raw 404 error from {provider}: {raw}")
+        return LLMError(
+            f"Model not found ({provider}). Check {provider.upper()}_MODEL in your .env "
+            f"(currently: {getattr(settings, provider + '_model', 'unknown')})."
+        )
+
+    # ── Server / service errors ───────────────────────────────────────────────
+    if any(k in raw for k in ("500", "502", "503", "504")) or \
+       any(k in lower for k in ("service unavailable", "internal server error", "bad gateway", "overloaded")):
+        logger.debug(f"[LLM] Raw server error from {provider}: {raw}")
+        return LLMError(f"The {provider} service is temporarily unavailable. Try again in a few seconds.")
+
+    # ── Timeout / network ─────────────────────────────────────────────────────
+    if any(k in lower for k in ("timeout", "timed out", "read timeout", "connect timeout")):
+        logger.debug(f"[LLM] Raw timeout error from {provider}: {raw}")
+        return LLMError(f"Request to {provider} timed out. The service may be overloaded — please try again.")
+
+    if any(k in lower for k in ("connection", "network", "unreachable", "failed to connect")):
+        logger.debug(f"[LLM] Raw network error from {provider}: {raw}")
+        return LLMError(f"Cannot reach the {provider} API. Check your internet connection.")
+
+    # ── Empty response ────────────────────────────────────────────────────────
+    if any(k in lower for k in ("empty response", "no content", "none", "finish_reason")):
+        logger.debug(f"[LLM] Empty response from {provider}: {raw}")
+        return LLMError(f"The {provider} API returned an empty response. Please try again.")
+
+    # ── Fallback — generic but clean ──────────────────────────────────────────
+    logger.debug(f"[LLM] Unclassified error from {provider}: {raw}")
+    return LLMError(f"The {provider} AI service returned an unexpected error. Please try again.")
 
 
 class LLMService:
@@ -50,11 +113,12 @@ class LLMService:
             elif self.provider == "anthropic":
                 result = self._anthropic_complete(prompt, system_prompt, temperature, max_tokens)
             else:
-                raise LLMError(f"Unknown provider: {self.provider}")
+                raise LLMError(f"Unknown LLM provider '{self.provider}'. Check LLM_PROVIDER in your .env.")
         except LLMError:
-            raise
+            raise  # already classified and clean
         except Exception as e:
-            raise LLMError(f"LLM call failed [{self.provider}]: {str(e)}") from e
+            # Catch anything the provider method didn't already wrap
+            raise _classify_api_error(self.provider, e) from e
 
         elapsed = time.perf_counter() - t0
         logger.info(f"[LLM] Response received in {elapsed:.1f}s ({len(result)} chars): {result[:300]}{'...' if len(result) > 300 else ''}")
@@ -76,21 +140,19 @@ class LLMService:
         import google.generativeai as genai
         logger.info(f"[Gemini] Using model: {settings.gemini_model}")
         genai.configure(api_key=settings.gemini_api_key)
-
-        # Gemini supports system instructions natively in newer SDK versions
         model = genai.GenerativeModel(
             model_name=settings.gemini_model,
             system_instruction=system_prompt if system_prompt else None,
         )
         logger.info("[Gemini] Sending request to Google AI API...")
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            },
-        )
-        return response.text.strip()
+        try:
+            response = model.generate_content(
+                prompt,
+                generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+            )
+            return response.text.strip()
+        except Exception as e:
+            raise _classify_api_error("gemini", e) from e
 
     # --------------------------------------------------------------------------
     # Ollama - local, no API key needed
@@ -148,11 +210,14 @@ class LLMService:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         logger.info("[Groq] Sending request...")
-        response = client.chat.completions.create(
-            model=settings.groq_model, messages=messages,
-            temperature=temperature, max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model=settings.groq_model, messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise _classify_api_error("groq", e) from e
 
     # --------------------------------------------------------------------------
     # HuggingFace
@@ -183,11 +248,14 @@ class LLMService:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         logger.info("[OpenAI] Sending request...")
-        response = client.chat.completions.create(
-            model=settings.openai_model, messages=messages,
-            temperature=temperature, max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model=settings.openai_model, messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise _classify_api_error("openai", e) from e
 
     # --------------------------------------------------------------------------
     # Anthropic
@@ -204,8 +272,11 @@ class LLMService:
         if system_prompt:
             kwargs["system"] = system_prompt
         logger.info("[Anthropic] Sending request...")
-        response = client.messages.create(**kwargs)
-        return response.content[0].text.strip()
+        try:
+            response = client.messages.create(**kwargs)
+            return response.content[0].text.strip()
+        except Exception as e:
+            raise _classify_api_error("anthropic", e) from e
 
 
 # --------------------------------------------------------------------------

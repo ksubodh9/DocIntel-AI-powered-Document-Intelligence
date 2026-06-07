@@ -138,3 +138,27 @@ def retrieve_chunks(
     chunks.sort(key=lambda x: x["distance"])
     logger.info(f"[VectorStore] Retrieved {len(chunks)} chunks for query (top score={chunks[0]['relevance_score'] if chunks else 0:.3f})")
     return chunks
+
+
+def retrieve_chunks_multi(
+    doc_ids: list[str],
+    query: str,
+    top_k: int | None = None,
+) -> list[dict]:
+    """
+    Retrieve chunks across multiple documents, merge and re-rank by relevance.
+    Each result includes doc_id so the caller knows which document it came from.
+    """
+    top_k = top_k or settings.top_k_retrieval
+    all_chunks: list[dict] = []
+    for doc_id in doc_ids:
+        try:
+            chunks = retrieve_chunks(doc_id, query, top_k=top_k)
+            for c in chunks:
+                c["doc_id"] = doc_id
+            all_chunks.extend(chunks)
+        except Exception as e:
+            logger.warning(f"[VectorStore] Failed to retrieve from doc {doc_id}: {e}")
+    # Global re-rank by relevance score, keep top_k
+    all_chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return all_chunks[:top_k]

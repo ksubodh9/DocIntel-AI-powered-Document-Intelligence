@@ -103,6 +103,48 @@ Question: {question}
 Answer based only on the context above:"""
 
 
+# ── Metadata Extraction ───────────────────────────────────────────────────────
+
+METADATA_EXTRACTION_PROMPT = """Extract structured metadata from this document.
+
+DOCUMENT (first 3000 characters):
+{text}
+
+Respond ONLY with valid JSON. Use null for any field you cannot determine:
+{{
+  "title": "<document title or null>",
+  "author": "<author name(s) or null>",
+  "date": "<publication/creation date or null>",
+  "language": "<ISO 639-1 language code, e.g. en, fr, de>",
+  "document_length": "<estimated length: short/medium/long>",
+  "reading_time_minutes": <integer estimate>,
+  "tone": "<formal/informal/technical/academic/conversational>",
+  "key_sections": ["section1", "section2"],
+  "target_audience": "<who this document is written for>"
+}}"""
+
+
+# ── Document Comparison ───────────────────────────────────────────────────────
+
+COMPARISON_PROMPT = """You are a document analysis expert. Compare these two documents.
+
+DOCUMENT A — {title_a} ({type_a}):
+{summary_a}
+Topics: {topics_a}
+
+DOCUMENT B — {title_b} ({type_b}):
+{summary_b}
+Topics: {topics_b}
+
+Respond ONLY with valid JSON:
+{{
+  "similarities": ["point1", "point2", "point3"],
+  "differences": ["point1", "point2", "point3"],
+  "recommendation": "<one sentence on when to use A vs B, or which is more relevant>",
+  "detailed_comparison": "<2-3 paragraph detailed comparison in prose>"
+}}"""
+
+
 # ── Suggested Questions ───────────────────────────────────────────────────────
 
 SUGGESTED_QUESTIONS_PROMPT = """Based on this document, generate 5 insightful questions that a reader might want to ask.

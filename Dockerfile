@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libmupdf-dev \
     libfreetype6-dev \
     gcc \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

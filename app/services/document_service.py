@@ -1,6 +1,6 @@
 """
-Document service: orchestrates PDF processing, RAG indexing, classification, and summarization.
-Logs every step from file received to prompt sent to LLM.
+Document service: orchestrates PDF processing, RAG indexing, classification,
+summarization, metadata extraction, table extraction, and chat (single + multi-doc).
 """
 
 import uuid
@@ -14,14 +14,16 @@ from sqlalchemy.orm import Session
 from app.config.settings import get_settings
 from app.models.document import Document, ChatMessage
 from app.utils.pdf_utils import extract_pdf, validate_pdf, PDFValidationError
-from app.rag.chunker import chunk_pages
-from app.rag.vectorstore import index_chunks, retrieve_chunks, delete_collection
+from app.rag.chunker import chunk_pages, TextChunk
+from app.rag.vectorstore import index_chunks, retrieve_chunks, retrieve_chunks_multi, delete_collection
 from app.services.llm_service import LLMService, LLMError
 from app.prompts.templates import (
     CLASSIFICATION_PROMPT,
     SHORT_SUMMARY_PROMPT,
     DETAILED_SUMMARY_PROMPT,
     TOPICS_EXTRACTION_PROMPT,
+    METADATA_EXTRACTION_PROMPT,
+    COMPARISON_PROMPT,
     QA_SYSTEM_PROMPT,
     QA_USER_PROMPT,
     SUGGESTED_QUESTIONS_PROMPT,
@@ -58,16 +60,16 @@ class DocumentService:
         )
         self.db.add(doc)
         self.db.commit()
-        logger.info(f"[Upload] DB record created (status=processing)")
+        logger.info("[Upload] DB record created (status=processing)")
 
         try:
             # Step 1: validate
-            logger.info("[Upload] Step 1/4 - Validating PDF...")
+            logger.info("[Upload] Step 1/5 - Validating PDF...")
             validate_pdf(file_path, original_filename)
             logger.info("[Upload] Validation passed")
 
-            # Step 2: extract text
-            logger.info("[Upload] Step 2/4 - Extracting text from PDF...")
+            # Step 2: extract text + tables + metadata
+            logger.info("[Upload] Step 2/5 - Extracting text, tables, and metadata...")
             t_extract = time.perf_counter()
             pdf_content = extract_pdf(file_path, original_filename)
             logger.info(
@@ -75,15 +77,37 @@ class DocumentService:
                 f"pages={pdf_content.page_count}  "
                 f"words={sum(p.word_count for p in pdf_content.pages)}  "
                 f"method={pdf_content.extraction_method}  "
-                f"scanned={pdf_content.is_scanned}"
+                f"scanned={pdf_content.is_scanned}  "
+                f"tables={len(pdf_content.tables)}"
             )
             doc.page_count = pdf_content.page_count
 
-            if pdf_content.is_scanned:
+            # Cache full_text in DB so downstream calls never re-parse the file
+            doc.full_text = pdf_content.full_text
+
+            # Store native PDF metadata
+            doc.doc_metadata = pdf_content.native_metadata
+
+            # Store extracted tables
+            if pdf_content.tables:
+                doc.has_tables = True
+                doc.table_count = len(pdf_content.tables)
+                doc.tables = [
+                    {"page": t.page_number, "caption": t.caption, "markdown": t.markdown}
+                    for t in pdf_content.tables
+                ]
+            else:
+                doc.has_tables = False
+                doc.table_count = 0
+
+            if pdf_content.is_scanned and pdf_content.extraction_method != "ocr":
                 doc.status = "error"
-                doc.error_message = "Scanned PDF detected. OCR not yet supported. Upload a text-based PDF."
+                doc.error_message = (
+                    "Scanned PDF detected and OCR is not available. "
+                    "Install pytesseract to process scanned PDFs."
+                )
                 self.db.commit()
-                logger.warning("[Upload] ABORTED - scanned PDF")
+                logger.warning("[Upload] ABORTED - scanned PDF, OCR unavailable")
                 return doc
 
             if not pdf_content.full_text.strip():
@@ -95,26 +119,36 @@ class DocumentService:
 
             logger.info(f"[Upload] Text preview: {pdf_content.full_text[:200].strip()!r}...")
 
-            # Step 3: chunk
-            logger.info("[Upload] Step 3/4 - Chunking text...")
+            # Step 3: chunk text
+            logger.info("[Upload] Step 3/5 - Chunking text...")
             t_chunk = time.perf_counter()
             chunks = chunk_pages(pdf_content.pages, doc_id)
+
+            # Step 3b: also create chunks for tables so they're queryable via RAG
+            if pdf_content.tables:
+                table_chunks = _make_table_chunks(pdf_content.tables, doc_id, len(chunks))
+                chunks.extend(table_chunks)
+                logger.info(f"[Upload] Added {len(table_chunks)} table chunk(s)")
+
             logger.info(
                 f"[Upload] Chunking done in {time.perf_counter()-t_chunk:.1f}s  "
-                f"chunks={len(chunks)}  "
-                f"chunk_size={settings.chunk_size}  overlap={settings.chunk_overlap}"
+                f"chunks={len(chunks)}"
             )
 
-            # Step 4: embed and index
-            logger.info(f"[Upload] Step 4/4 - Embedding {len(chunks)} chunks and indexing in ChromaDB...")
+            # Step 4: embed + index
+            logger.info(f"[Upload] Step 4/5 - Embedding {len(chunks)} chunks...")
             t_embed = time.perf_counter()
             collection_name = index_chunks(doc_id, chunks)
             logger.info(
                 f"[Upload] Embedding + indexing done in {time.perf_counter()-t_embed:.1f}s  "
                 f"collection={collection_name}"
             )
-
             doc.collection_name = collection_name
+
+            # Step 5: word count in metadata
+            total_words = sum(p.word_count for p in pdf_content.pages)
+            doc.doc_metadata = {**(doc.doc_metadata or {}), "word_count": total_words}
+
             doc.status = "ready"
             logger.info(f"[Upload] COMPLETE in {time.perf_counter()-t_start:.1f}s  status=ready")
 
@@ -138,13 +172,28 @@ class DocumentService:
     def classify_document(self, doc: Document) -> Document:
         logger.info(f"[Classify] START doc_id={doc.id}")
         text_preview = self._get_text_preview(doc, max_chars=3000)
-        logger.info(f"[Classify] Using first {len(text_preview)} chars for classification")
-        prompt = CLASSIFICATION_PROMPT.format(text=text_preview)
-        logger.info("[Classify] Sending classification prompt to LLM...")
-        result = self.llm.complete_json(prompt)
+        logger.info(f"[Classify] Using first {len(text_preview)} chars")
+        result = self.llm.complete_json(CLASSIFICATION_PROMPT.format(text=text_preview))
         doc.document_type = result.get("document_type", "Other")
         doc.classification_confidence = float(result.get("confidence", 0.5))
-        logger.info(f"[Classify] Result: type={doc.document_type}  confidence={doc.classification_confidence:.0%}")
+        logger.info(f"[Classify] type={doc.document_type}  confidence={doc.classification_confidence:.0%}")
+        self.db.commit()
+        self.db.refresh(doc)
+        return doc
+
+    # --------------------------------------------------------------------------
+    # Metadata Extraction
+    # --------------------------------------------------------------------------
+
+    def extract_metadata(self, doc: Document) -> Document:
+        logger.info(f"[Metadata] START doc_id={doc.id}")
+        text_preview = self._get_text_preview(doc, max_chars=3000)
+        llm_meta = self.llm.complete_json(METADATA_EXTRACTION_PROMPT.format(text=text_preview))
+        # Merge native PDF metadata (already in doc.doc_metadata) with LLM-extracted
+        existing = doc.doc_metadata or {}
+        merged = {**existing, **{k: v for k, v in llm_meta.items() if v is not None}}
+        doc.doc_metadata = merged
+        logger.info(f"[Metadata] Extracted: {list(merged.keys())}")
         self.db.commit()
         self.db.refresh(doc)
         return doc
@@ -158,22 +207,22 @@ class DocumentService:
         full_text = self._get_full_text(doc)
         logger.info(f"[Summarize] Full text length: {len(full_text)} chars")
         text_for_summary = self._truncate_for_llm(full_text, max_chars=12000)
-        logger.info(f"[Summarize] Truncated to {len(text_for_summary)} chars for LLM context")
 
-        logger.info("[Summarize] Step 1/3 - Generating short summary...")
-        doc.short_summary = self.llm.complete(SHORT_SUMMARY_PROMPT.format(text=text_for_summary), temperature=0.2)
-        logger.info(f"[Summarize] Short summary: {doc.short_summary[:150]}...")
+        logger.info("[Summarize] Step 1/3 - Short summary...")
+        doc.short_summary = self.llm.complete(
+            SHORT_SUMMARY_PROMPT.format(text=text_for_summary), temperature=0.2
+        )
 
-        logger.info("[Summarize] Step 2/3 - Generating detailed summary...")
-        doc.detailed_summary = self.llm.complete(DETAILED_SUMMARY_PROMPT.format(text=text_for_summary), temperature=0.2)
-        logger.info(f"[Summarize] Detailed summary: {doc.detailed_summary[:150]}...")
+        logger.info("[Summarize] Step 2/3 - Detailed summary...")
+        doc.detailed_summary = self.llm.complete(
+            DETAILED_SUMMARY_PROMPT.format(text=text_for_summary), temperature=0.2
+        )
 
-        logger.info("[Summarize] Step 3/3 - Extracting topics, keywords, entities...")
+        logger.info("[Summarize] Step 3/3 - Topics/keywords/entities...")
         topics_data = self.llm.complete_json(TOPICS_EXTRACTION_PROMPT.format(text=text_for_summary))
         doc.topics = topics_data.get("topics", [])
         doc.keywords = topics_data.get("keywords", [])
         doc.entities = topics_data.get("entities", [])
-        logger.info(f"[Summarize] Topics: {doc.topics}  Keywords: {doc.keywords[:3]}  Entities: {doc.entities[:3]}")
 
         self.db.commit()
         self.db.refresh(doc)
@@ -185,28 +234,59 @@ class DocumentService:
     # --------------------------------------------------------------------------
 
     def generate_suggested_questions(self, doc: Document) -> Document:
-        logger.info(f"[Questions] Generating suggested questions for doc_id={doc.id}")
+        logger.info(f"[Questions] doc_id={doc.id}")
         summary = doc.short_summary or self._get_text_preview(doc, max_chars=1000)
         doc_type = doc.document_type or "Unknown"
-        result = self.llm.complete_json(SUGGESTED_QUESTIONS_PROMPT.format(summary=summary, doc_type=doc_type))
+        result = self.llm.complete_json(
+            SUGGESTED_QUESTIONS_PROMPT.format(summary=summary, doc_type=doc_type)
+        )
         doc.suggested_questions = result.get("questions", [])
-        logger.info(f"[Questions] Generated {len(doc.suggested_questions)} questions")
         self.db.commit()
         self.db.refresh(doc)
         return doc
 
     # --------------------------------------------------------------------------
-    # Chat / Q&A
+    # Document Comparison
+    # --------------------------------------------------------------------------
+
+    def compare_documents(self, doc_a: Document, doc_b: Document) -> dict:
+        logger.info(f"[Compare] doc_a={doc_a.id} doc_b={doc_b.id}")
+        # Ensure both have summaries; generate on-the-fly if missing
+        if not doc_a.short_summary:
+            doc_a = self.summarize_document(doc_a)
+        if not doc_b.short_summary:
+            doc_b = self.summarize_document(doc_b)
+
+        prompt = COMPARISON_PROMPT.format(
+            title_a=doc_a.original_filename,
+            type_a=doc_a.document_type or "Unknown",
+            summary_a=doc_a.short_summary,
+            topics_a=", ".join(doc_a.topics or []),
+            title_b=doc_b.original_filename,
+            type_b=doc_b.document_type or "Unknown",
+            summary_b=doc_b.short_summary,
+            topics_b=", ".join(doc_b.topics or []),
+        )
+        result = self.llm.complete_json(prompt)
+        logger.info("[Compare] COMPLETE")
+        return {
+            "similarities": result.get("similarities", []),
+            "differences": result.get("differences", []),
+            "recommendation": result.get("recommendation", ""),
+            "detailed_comparison": result.get("detailed_comparison", ""),
+        }
+
+    # --------------------------------------------------------------------------
+    # Chat (single document)
     # --------------------------------------------------------------------------
 
     def chat(self, doc: Document, user_message: str, include_history: bool = True) -> dict:
-        logger.info(f"[Chat] START doc_id={doc.id}  question={user_message!r}")
+        logger.info(f"[Chat] doc_id={doc.id}  question={user_message!r}")
 
         user_msg = ChatMessage(document_id=doc.id, role="user", content=user_message)
         self.db.add(user_msg)
         self.db.commit()
 
-        logger.info(f"[Chat] Retrieving top-{settings.top_k_retrieval} chunks from ChromaDB...")
         t_retrieve = time.perf_counter()
         chunks = retrieve_chunks(doc.id, user_message, top_k=settings.top_k_retrieval)
         logger.info(
@@ -214,40 +294,64 @@ class DocumentService:
             f"scores={[round(c['relevance_score'],3) for c in chunks]}"
         )
 
-        if not chunks:
-            logger.info("[Chat] No relevant chunks found - returning default message")
-            answer = "I could not find this information in the document."
-            citations = []
-        else:
-            for i, chunk in enumerate(chunks, 1):
-                logger.info(f"[Chat] Chunk {i} (page={chunk['page_number']} score={chunk['relevance_score']:.3f}): {chunk['text'][:100]}...")
-
-            context_parts = [f"[Chunk {i} | Page {c['page_number']}]\n{c['text']}" for i, c in enumerate(chunks, 1)]
-            context = "\n\n---\n\n".join(context_parts)
-            history = self._format_history(doc.id, last_n=6) if include_history else ""
-
-            logger.info(f"[Chat] Building Q&A prompt (context={len(context)} chars)...")
-            prompt = QA_USER_PROMPT.format(context=context, history=history, question=user_message)
-
-            logger.info("[Chat] Sending Q&A prompt to LLM...")
-            answer = self.llm.complete(prompt, system_prompt=QA_SYSTEM_PROMPT, temperature=0.1)
-            logger.info(f"[Chat] Answer: {answer[:200]}...")
-
-            citations = [
-                {"page": c["page_number"], "text": c["text"][:300] + ("..." if len(c["text"]) > 300 else ""), "chunk_id": c["chunk_id"]}
-                for c in chunks[:3]
-            ]
+        answer, citations = self._generate_answer(chunks, user_message, doc.id, include_history)
 
         assistant_msg = ChatMessage(document_id=doc.id, role="assistant", content=answer, citations=citations)
         self.db.add(assistant_msg)
         self.db.commit()
         self.db.refresh(assistant_msg)
-        logger.info(f"[Chat] COMPLETE  citations={len(citations)}")
 
         return {"message_id": assistant_msg.id, "answer": answer, "citations": citations, "sources_found": bool(chunks)}
 
     # --------------------------------------------------------------------------
-    # Helpers
+    # Multi-document Chat
+    # --------------------------------------------------------------------------
+
+    def chat_multi(self, doc_ids: list[str], doc_map: dict, user_message: str) -> dict:
+        """
+        Chat across multiple documents. doc_map is {doc_id: Document}.
+        """
+        logger.info(f"[MultiChat] docs={doc_ids}  question={user_message!r}")
+
+        t_retrieve = time.perf_counter()
+        chunks = retrieve_chunks_multi(doc_ids, user_message, top_k=settings.top_k_retrieval)
+        logger.info(f"[MultiChat] Retrieved {len(chunks)} chunks in {time.perf_counter()-t_retrieve:.2f}s")
+
+        # Enrich chunks with document names
+        for c in chunks:
+            did = c.get("doc_id", "")
+            c["document_name"] = doc_map.get(did, {}).original_filename if did in doc_map else did
+
+        # Build context with document attribution
+        context_parts = []
+        for i, c in enumerate(chunks, 1):
+            doc_name = c.get("document_name", "Unknown")
+            context_parts.append(f"[Chunk {i} | {doc_name} | Page {c['page_number']}]\n{c['text']}")
+        context = "\n\n---\n\n".join(context_parts) if context_parts else ""
+
+        if not chunks:
+            answer = "I could not find relevant information across the selected documents."
+            citations = []
+        else:
+            prompt = QA_USER_PROMPT.format(context=context, history="", question=user_message)
+            answer = self.llm.complete(prompt, system_prompt=QA_SYSTEM_PROMPT, temperature=0.1)
+            citations = [
+                {
+                    "page": c["page_number"],
+                    "text": c["text"][:300] + ("..." if len(c["text"]) > 300 else ""),
+                    "chunk_id": c["chunk_id"],
+                    "relevance_score": c["relevance_score"],
+                    "document_id": c.get("doc_id", ""),
+                    "document_name": c.get("document_name", ""),
+                }
+                for c in chunks[:3]
+            ]
+
+        msg_id = str(uuid.uuid4())
+        return {"message_id": msg_id, "answer": answer, "citations": citations, "sources_found": bool(chunks)}
+
+    # --------------------------------------------------------------------------
+    # CRUD helpers
     # --------------------------------------------------------------------------
 
     def get_chat_history(self, doc_id: str) -> list:
@@ -261,19 +365,55 @@ class DocumentService:
     def get_document(self, doc_id: str) -> Optional[Document]:
         return self.db.query(Document).filter(Document.id == doc_id).first()
 
-    def _get_text_preview(self, doc: Document, max_chars: int = 3000) -> str:
-        try:
-            pdf_content = extract_pdf(Path(doc.file_path), doc.original_filename)
-            return pdf_content.full_text[:max_chars]
-        except Exception:
-            return ""
+    def get_all_ready_documents(self) -> list[Document]:
+        return self.db.query(Document).filter(Document.status == "ready").all()
+
+    # --------------------------------------------------------------------------
+    # Private helpers
+    # --------------------------------------------------------------------------
+
+    def _generate_answer(self, chunks, user_message, doc_id, include_history):
+        if not chunks:
+            return "I could not find this information in the document.", []
+
+        for i, c in enumerate(chunks, 1):
+            logger.info(f"[Chat] Chunk {i} (page={c['page_number']} score={c['relevance_score']:.3f}): {c['text'][:100]}...")
+
+        context_parts = [f"[Chunk {i} | Page {c['page_number']}]\n{c['text']}" for i, c in enumerate(chunks, 1)]
+        context = "\n\n---\n\n".join(context_parts)
+        history = self._format_history(doc_id, last_n=6) if include_history else ""
+
+        prompt = QA_USER_PROMPT.format(context=context, history=history, question=user_message)
+        answer = self.llm.complete(prompt, system_prompt=QA_SYSTEM_PROMPT, temperature=0.1)
+
+        citations = [
+            {
+                "page": c["page_number"],
+                "text": c["text"][:300] + ("..." if len(c["text"]) > 300 else ""),
+                "chunk_id": c["chunk_id"],
+                "relevance_score": round(c["relevance_score"], 3),
+            }
+            for c in chunks[:3]
+        ]
+        return answer, citations
 
     def _get_full_text(self, doc: Document) -> str:
+        # Use cached full_text from DB — never re-parse the file
+        if doc.full_text:
+            return doc.full_text
+        # Fallback: re-parse (only for documents uploaded before this version)
+        logger.warning(f"[Service] full_text not cached for doc {doc.id} — re-parsing")
         try:
             pdf_content = extract_pdf(Path(doc.file_path), doc.original_filename)
+            doc.full_text = pdf_content.full_text
+            self.db.commit()
             return pdf_content.full_text
-        except Exception:
+        except Exception as e:
+            logger.error(f"[Service] Failed to re-parse PDF: {e}")
             return ""
+
+    def _get_text_preview(self, doc: Document, max_chars: int = 3000) -> str:
+        return self._get_full_text(doc)[:max_chars]
 
     def _truncate_for_llm(self, text: str, max_chars: int = 12000) -> str:
         if len(text) <= max_chars:
@@ -287,4 +427,26 @@ class DocumentService:
         recent = messages[-(last_n * 2):]
         if not recent:
             return "No previous conversation."
-        return "\n".join(f"{'User' if m.role == 'user' else 'Assistant'}: {m.content[:500]}" for m in recent)
+        return "\n".join(
+            f"{'User' if m.role == 'user' else 'Assistant'}: {m.content[:500]}" for m in recent
+        )
+
+
+# --------------------------------------------------------------------------
+# Helper: make RAG chunks from extracted tables
+# --------------------------------------------------------------------------
+
+def _make_table_chunks(tables, doc_id: str, start_index: int) -> list[TextChunk]:
+    """Wrap each extracted table as a TextChunk so it's indexed in ChromaDB."""
+    chunks = []
+    for i, table in enumerate(tables):
+        text = f"{table.caption}\n\n{table.markdown}"
+        chunks.append(
+            TextChunk(
+                chunk_id=f"doc_{doc_id}_table_{i}",
+                text=text,
+                page_number=table.page_number,
+                chunk_index=start_index + i,
+            )
+        )
+    return chunks

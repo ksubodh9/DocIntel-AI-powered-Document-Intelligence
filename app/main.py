@@ -61,13 +61,24 @@ async def startup():
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.vectorstore_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure the SQLite DB directory exists (important when DATABASE_URL points
-    # to a named Docker volume path like /app/data/db/ that may be empty on first run).
+    # Ensure the SQLite DB directory exists and clean up stale lock files.
+    # Stale -journal / -wal / -shm files left from a previous crash can trigger
+    # SQLITE_IOERR_DELETE (code 2570) even when journal_mode=MEMORY is set,
+    # because SQLite tries to remove the old file before applying the new mode.
     from pathlib import Path
     import re
     db_path_match = re.match(r"sqlite:///(.+)", settings.database_url)
     if db_path_match:
-        Path(db_path_match.group(1)).parent.mkdir(parents=True, exist_ok=True)
+        db_path = Path(db_path_match.group(1))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in ("-journal", "-wal", "-shm"):
+            stale = db_path.parent / (db_path.name + suffix)
+            if stale.exists():
+                try:
+                    stale.unlink()
+                    logger.warning(f"Removed stale SQLite lock file: {stale.name}")
+                except OSError as e:
+                    logger.warning(f"Could not remove {stale.name}: {e}")
 
     init_db()
     logger.info("Database initialised.")

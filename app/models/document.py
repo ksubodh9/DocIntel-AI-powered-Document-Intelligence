@@ -2,7 +2,7 @@
 SQLAlchemy ORM models for Documents and Chat History.
 """
 
-from sqlalchemy import Column, String, Integer, Float, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, ForeignKey, JSON, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import uuid
@@ -43,6 +43,14 @@ class Document(Base):
     keywords = Column(JSON, nullable=True)      # list[str]
     entities = Column(JSON, nullable=True)      # list[str]
     suggested_questions = Column(JSON, nullable=True)  # list[str]
+
+    # Metadata (native PDF headers + computed + LLM-extracted)
+    doc_metadata = Column(JSON, nullable=True)  # {title, author, date, language, word_count, ...}
+
+    # Table extraction
+    has_tables = Column(Boolean, default=False)
+    table_count = Column(Integer, default=0)
+    tables = Column(JSON, nullable=True)        # list[{page, markdown, caption}]
 
     # Vector store
     collection_name = Column(String(255), nullable=True)  # ChromaDB collection id
