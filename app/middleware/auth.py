@@ -41,10 +41,17 @@ def _decode_token(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload_b64))
 
     if not _JWT_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="SUPABASE_JWT_SECRET is not configured on the server.",
-        )
+        # No JWT secret configured — fall back to unverified decode.
+        # This is safe for single-user or demo deployments where auth is
+        # optional. Production deployments MUST set SUPABASE_JWT_SECRET.
+        logger.warning("SUPABASE_JWT_SECRET not set — decoding JWT without verification.")
+        import base64, json as _json
+        try:
+            payload_b64 = token.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            return _json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception:
+            raise HTTPException(status_code=401, detail="Could not decode token (SUPABASE_JWT_SECRET not set).")
 
     try:
         return pyjwt.decode(

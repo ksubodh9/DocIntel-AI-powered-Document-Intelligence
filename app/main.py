@@ -66,7 +66,19 @@ async def add_process_time(request: Request, call_next):
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Unhandled error on {request.method} {request.url}: {exc}")
-    return JSONResponse(status_code=500, content={"error": "Internal server error", "detail": str(exc)})
+    # Starlette's ServerErrorMiddleware runs OUTSIDE CORSMiddleware, so error
+    # responses that reach here would normally be missing CORS headers.
+    # We add them manually so the browser can read the error detail.
+    response = JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc)},
+    )
+    origin = request.headers.get("origin", "")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
 
 
 @app.on_event("startup")
@@ -74,16 +86,26 @@ async def startup():
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"LLM Provider : {settings.llm_provider}")
     logger.info(f"Embedding    : {settings.embedding_model}")
+    logger.info(f"Database     : {settings.database_url}")
 
-    settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    settings.vectorstore_dir.mkdir(parents=True, exist_ok=True)
+    # Create data directories — wrap in try/except so a read-only source dir
+    # (e.g. some Render/Railway environments) doesn't abort the startup and
+    # prevent init_db() from running.
+    for d in (settings.upload_dir, settings.vectorstore_dir):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not create directory {d}: {e}")
 
     from pathlib import Path
     import re
     db_path_match = re.match(r"sqlite:///(.+)", settings.database_url)
     if db_path_match:
         db_path = Path(db_path_match.group(1))
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not create DB directory {db_path.parent}: {e}")
         for suffix in ("-journal", "-wal", "-shm"):
             stale = db_path.parent / (db_path.name + suffix)
             if stale.exists():
@@ -93,8 +115,18 @@ async def startup():
                 except OSError as e:
                     logger.warning(f"Could not remove {stale.name}: {e}")
 
-    init_db()
-    logger.info("Database initialised.")
+    # init_db ALWAYS runs — even if directory creation partially failed
+    try:
+        init_db()
+        logger.info("Database initialised.")
+    except Exception as e:
+        # Log but don't crash — health endpoint stays up, and the specific
+        # error will appear in Render's logs to guide the fix
+        logger.error(f"Database initialisation failed: {e}", exc_info=True)
+        logger.error(
+            "TIP: If this is a Render/Railway deployment, set "
+            "DATABASE_URL=sqlite:////tmp/pdf_agent.db in environment variables."
+        )
 
     def _warm_embeddings():
         try:
