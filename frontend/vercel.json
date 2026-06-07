@@ -1,10 +1,5 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
-  "env": {
-    "VITE_SUPABASE_URL": "@supabase_url",
-    "VITE_SUPABASE_ANON_KEY": "@supabase_anon_key",
-    "VITE_API_BASE": "@api_base"
-  }
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
