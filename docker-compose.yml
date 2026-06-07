@@ -1,0 +1,78 @@
+version: "3.9"
+
+# PDF Agent - Docker Compose
+#
+# IMPORTANT - Ollama networking:
+# Ollama runs on your Windows host machine, NOT inside Docker.
+# Inside a container, "localhost" means the container itself.
+# "host.docker.internal" is Docker Desktop's special hostname
+# that routes back to your actual Windows machine.
+#
+# Usage:
+#   1. Make sure Ollama is running on your machine (check taskbar icon)
+#   2. Copy .env.example to .env  (set your GEMINI_API_KEY there)
+#   3. docker compose up --build
+#   4. Open http://localhost:8501
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf-agent-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Uploads and vectorstore use bind-mounts so files live on your Windows drive.
+      - ./data/uploads:/app/data/uploads
+      - ./data/vectorstore:/app/data/vectorstore
+      # SQLite uses a NAMED volume (pure Linux ext4 filesystem).
+      # Bind-mounting the DB file through WSL2 causes SQLite disk I/O errors
+      # because Windows doesn't support POSIX file locking. Named volumes avoid this.
+      - pdf_agent_db:/app/data/db
+    env_file:
+      - .env
+    environment:
+      # Point SQLite to the named volume path (overrides .env DATABASE_URL if set)
+      - DATABASE_URL=sqlite:////app/data/db/pdf_agent.db
+      # Override OLLAMA_HOST so the container reaches the host machine's Ollama.
+      - OLLAMA_HOST=host.docker.internal
+      - OLLAMA_PORT=11434
+      # Cap math-library threads (torch/sentence-transformers). Keeps CPU and
+      # RAM usage predictable. Raise if your host has spare cores.
+      - OMP_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - TOKENIZERS_PARALLELISM=false
+    # Makes host.docker.internal work on Linux Docker too (no-op on Docker Desktop)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 4g
+    mem_reservation: 2g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: pdf-agent-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE=http://backend:8000/api/v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Named volume for SQLite - lives entirely inside Docker's storage on Linux/WSL2,
+# avoiding the file-locking issues that occur with Windows bind-mounts.
+volumes:
+  pdf_agent_db:
