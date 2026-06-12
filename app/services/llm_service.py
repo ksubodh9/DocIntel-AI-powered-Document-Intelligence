@@ -23,14 +23,26 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+# Shown to end users when anything goes wrong. Deliberately generic — it must
+# never reveal provider names, model names, API keys, or .env configuration.
+GENERIC_USER_MESSAGE = "Something went wrong while processing the document. Please try again."
+BUSY_USER_MESSAGE = "The service is busy right now. Please try again in a moment."
+
+
 class LLMError(Exception):
     """
-    User-facing LLM error with an optional retry_after hint (seconds).
-    The message is always clean and human-readable.
+    LLM error carrying two messages:
+
+      * ``message``      — detailed, technical text for server logs only.
+      * ``user_message`` — safe, generic text returned to the client. It never
+                           leaks internal details (provider, model, .env, keys).
+
+    ``retry_after`` is an optional hint (seconds) for rate-limit responses.
     """
-    def __init__(self, message: str, retry_after: int = 0):
+    def __init__(self, message: str, retry_after: int = 0, user_message: Optional[str] = None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.user_message = user_message or GENERIC_USER_MESSAGE
 
 
 def _classify_api_error(provider: str, exc: Exception) -> "LLMError":
@@ -43,37 +55,49 @@ def _classify_api_error(provider: str, exc: Exception) -> "LLMError":
         import re as _re
         m = _re.search(r"retry[_ ](?:in|delay)[^\d]*(\d+\.?\d*)", raw, _re.IGNORECASE)
         wait = int(float(m.group(1))) + 1 if m else 0
-        hint = f" Please wait {wait}s." if wait else " Please wait a moment."
         logger.debug(f"[LLM] Rate-limit from {provider}: {raw}")
-        return LLMError(f"Rate limit reached ({provider}).{hint}", retry_after=wait)
+        return LLMError(
+            f"Rate limit reached ({provider}). retry_after={wait}s. {raw}",
+            retry_after=wait,
+            user_message=BUSY_USER_MESSAGE,
+        )
 
     if any(k in raw for k in ("401", "403")) or \
        any(k in lower for k in ("api key", "api_key", "authentication", "unauthorized",
                                 "permission denied", "invalid api key")):
         logger.debug(f"[LLM] Auth error from {provider}: {raw}")
-        return LLMError(f"API key error ({provider}). Check {provider.upper()}_API_KEY in .env.")
+        # Auth/key problems are a server-side misconfiguration — surface a
+        # generic message rather than telling the end user about .env / keys.
+        return LLMError(f"Auth error ({provider}). Check {provider.upper()}_API_KEY in .env. {raw}")
 
     if "404" in raw or ("not found" in lower and "model" in lower):
         logger.debug(f"[LLM] 404 from {provider}: {raw}")
-        return LLMError(
-            f"Model not found ({provider}). Check {provider.upper()}_MODEL in .env."
-        )
+        return LLMError(f"Model not found ({provider}). Check {provider.upper()}_MODEL in .env. {raw}")
 
     if any(k in raw for k in ("500", "502", "503", "504")) or \
        any(k in lower for k in ("service unavailable", "internal server error", "overloaded")):
         logger.debug(f"[LLM] Server error from {provider}: {raw}")
-        return LLMError(f"The {provider} service is temporarily unavailable. Try again.")
+        return LLMError(
+            f"Server error from {provider}: {raw}",
+            user_message="The service is temporarily unavailable. Please try again shortly.",
+        )
 
     if any(k in lower for k in ("timeout", "timed out", "read timeout", "connect timeout")):
         logger.debug(f"[LLM] Timeout from {provider}: {raw}")
-        return LLMError(f"Request to {provider} timed out. Try again.")
+        return LLMError(
+            f"Timeout from {provider}: {raw}",
+            user_message="The request took too long. Please try again.",
+        )
 
     if any(k in lower for k in ("connection", "network", "unreachable", "failed to connect")):
         logger.debug(f"[LLM] Network error from {provider}: {raw}")
-        return LLMError(f"Cannot reach the {provider} API. Check your internet connection.")
+        return LLMError(
+            f"Network error reaching {provider}: {raw}",
+            user_message="The service is temporarily unavailable. Please try again shortly.",
+        )
 
     logger.debug(f"[LLM] Unclassified error from {provider}: {raw}")
-    return LLMError(f"Unexpected error from {provider}. Please try again.")
+    return LLMError(f"Unclassified error from {provider}: {raw}")
 
 
 def _is_fallback_worthy(err: LLMError) -> bool:
@@ -87,7 +111,7 @@ def _is_fallback_worthy(err: LLMError) -> bool:
         "rate limit", "quota", "api key", "api_key", "authentication",
         "unauthorized", "model not found", "unavailable", "timed out",
         "cannot reach", "timeout", "overloaded", "bad gateway",
-        "permission denied", "invalid api key",
+        "permission denied", "invalid api key", "server error", "network error",
     ))
 
 

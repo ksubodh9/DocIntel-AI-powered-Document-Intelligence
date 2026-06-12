@@ -17,6 +17,7 @@ Endpoints:
   DELETE /document/{doc_id}         Delete a document
 """
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, Request
@@ -53,6 +54,22 @@ from app.config.settings import get_settings
 
 settings = get_settings()
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _llm_http_error(e: LLMError) -> HTTPException:
+    """Convert an LLMError into an HTTP error.
+
+    The full technical detail goes to the server logs; the client only ever
+    receives the safe, generic ``user_message`` (never provider/model/.env info).
+    A rate-limit hint maps to 429, everything else to 502.
+    """
+    logger.warning("[LLM] %s", e)
+    status_code = 429 if e.retry_after else 502
+    return HTTPException(
+        status_code=status_code,
+        detail={"message": e.user_message, "retry_after": e.retry_after},
+    )
 
 
 def get_document_service(
@@ -195,7 +212,7 @@ def classify_document(
     try:
         doc = svc.classify_document(doc)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
 
     _track(svc.db, user, "classify", doc_id)
     return ClassifyResponse(
@@ -221,7 +238,7 @@ def summarize_document(
         if not doc.suggested_questions:
             doc = svc.generate_suggested_questions(doc)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
 
     _track(svc.db, user, "summarize", doc_id)
     return SummaryResponse(
@@ -255,7 +272,7 @@ def chat_with_document(
     try:
         result = svc.chat(doc, request.message, request.include_history)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[Chat] Unexpected error: {e}", exc_info=True)
@@ -316,7 +333,7 @@ def get_suggested_questions(
         try:
             doc = svc.generate_suggested_questions(doc)
         except LLMError as e:
-            raise HTTPException(status_code=502, detail=str(e))
+            raise _llm_http_error(e)
 
     return SuggestedQuestionsResponse(
         document_id=doc.id,
@@ -337,7 +354,7 @@ def extract_metadata(
     try:
         doc = svc.extract_metadata(doc)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
     return MetadataResponse(document_id=doc.id, metadata=doc.doc_metadata or {})
 
 
@@ -381,7 +398,7 @@ def multi_chat(
     try:
         result = svc.chat_multi(request.document_ids, doc_map, request.message)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
 
     citations = [Citation(**c) for c in result["citations"]]
     return MultiChatResponse(
@@ -411,7 +428,7 @@ def compare_documents(
     try:
         result = svc.compare_documents(doc_a, doc_b)
     except LLMError as e:
-        raise HTTPException(status_code=429 if e.retry_after else 502, detail={"message": str(e), "retry_after": e.retry_after})
+        raise _llm_http_error(e)
 
     return CompareResponse(
         document_id_a=request.document_id_a,

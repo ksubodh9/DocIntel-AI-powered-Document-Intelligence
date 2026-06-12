@@ -151,7 +151,8 @@ class DocumentService:
             logger.error(f"[Upload] Validation error: {e}")
         except Exception as e:
             doc.status = "error"
-            doc.error_message = f"Processing failed: {str(e)}"
+            # Generic, safe message for the client; full detail goes to the logs.
+            doc.error_message = "We couldn't process this document. Please try again."
             logger.exception(f"[Upload] Unexpected error: {e}")
 
         self.db.commit()

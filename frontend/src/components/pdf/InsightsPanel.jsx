@@ -84,7 +84,7 @@ export default function InsightsPanel({ document, onAskQuestion, onAnalysisCompl
       // Notify parent to refresh doc data so results persist across tab switches
       onAnalysisComplete?.();
     } catch (err) {
-      const msg = err.userMessage || "Analysis failed. Check Docker logs for details.";
+      const msg = err.userMessage || "Something went wrong while analysing the document. Please try again.";
       setState({ step: "error", progress: 0, error: msg });
       toast({ title: "Analysis failed", description: msg, variant: "error" });
     }
@@ -134,9 +134,6 @@ export default function InsightsPanel({ document, onAskQuestion, onAnalysisCompl
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-red-800">Analysis failed</p>
             <p className="text-xs text-red-600 mt-0.5 break-words">{state.error}</p>
-            <p className="text-xs text-red-400 mt-1">
-              Run <code className="bg-red-100 px-1 rounded">docker compose logs backend --tail=30</code> to see the full error.
-            </p>
           </div>
         </div>
       )}
