@@ -6,6 +6,13 @@ from pydantic import BaseModel, Field
 from typing import Optional, Any
 from datetime import datetime
 
+from app.config.settings import get_settings
+
+# Single source of truth for the max chat-question length. Keeping the schema
+# bound (422) aligned with the route-level guard (400) avoids dead code and a
+# confusing mismatch between the two limits.
+_MAX_QUESTION_LENGTH = get_settings().max_question_length
+
 
 # ── Citation ──────────────────────────────────────────────────────────────────
 
@@ -73,13 +80,13 @@ class TablesResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     document_id: str
-    message: str = Field(..., min_length=1, max_length=2000)
+    message: str = Field(..., min_length=1, max_length=_MAX_QUESTION_LENGTH)
     include_history: bool = True
 
 
 class MultiChatRequest(BaseModel):
     document_ids: list[str] = Field(..., min_length=1)
-    message: str = Field(..., min_length=1, max_length=2000)
+    message: str = Field(..., min_length=1, max_length=_MAX_QUESTION_LENGTH)
     include_history: bool = False
 
 

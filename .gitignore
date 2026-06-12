@@ -1,4 +1,25 @@
+# Secrets / local config
 .env
+.env.*
+!.env.example
 .dockerignore
 .venv
+
+# Project notes
 PROJECT_GUIDE.md
+CLAUDE.md
+
+# User data — NEVER commit uploaded files, the DB, or the vector store.
+# These contain user content and PII.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+SECURITY_REVIEW.md

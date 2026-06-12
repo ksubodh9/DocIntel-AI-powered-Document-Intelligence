@@ -51,7 +51,7 @@ export default function Header({ document }) {
   if (!document) {
     return (
       <div className="flex h-14 items-center justify-between border-b bg-white px-6">
-        <p className="text-sm text-muted-foreground">Select or upload a document to get started</p>
+        <p className="text-sm text-muted-foreground">Upload a document to get started — PDF, Word, Excel, PowerPoint, CSV, HTML, or image</p>
         <BackendStatus />
       </div>
     );

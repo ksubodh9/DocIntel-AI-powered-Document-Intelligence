@@ -35,7 +35,10 @@ export default function Sidebar({
         <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600">
           <FileText className="h-4 w-4 text-white" />
         </div>
-        <span className="font-semibold text-white text-sm">PDF Agent</span>
+        <div>
+          <span className="font-semibold text-white text-sm">DocIntel</span>
+          <p className="text-[10px] text-slate-500 leading-tight">Document Intelligence</p>
+        </div>
       </div>
 
       {/* New upload button */}
@@ -45,7 +48,7 @@ export default function Sidebar({
           className="flex w-full items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-500 transition-colors"
         >
           <Plus className="h-4 w-4" />
-          Upload PDF
+          Upload Document
         </button>
       </div>
 

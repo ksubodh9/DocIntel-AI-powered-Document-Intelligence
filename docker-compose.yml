@@ -35,6 +35,14 @@ services:
       - MKL_NUM_THREADS=2
       - TOKENIZERS_PARALLELISM=false
       - FRONTEND_URL=http://localhost:3000
+      # Auth now fails closed. For local dev without a real Supabase JWT secret,
+      # set ALLOW_INSECURE_AUTH=true in your .env to bypass signature checks.
+      # Leave false (default) if SUPABASE_JWT_SECRET is set. NEVER true in prod.
+      - ALLOW_INSECURE_AUTH=${ALLOW_INSECURE_AUTH:-false}
+      # Optional extra CORS origins / tight preview regex (read from .env).
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      - CORS_ALLOWED_ORIGIN_REGEX=${CORS_ALLOWED_ORIGIN_REGEX:-}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     mem_limit: 4g

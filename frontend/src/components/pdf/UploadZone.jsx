@@ -4,6 +4,25 @@ import { Upload, FileText, Loader2, AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { uploadDocument } from "@/lib/api";
 
+const ACCEPTED_TYPES = {
+  "application/pdf": [".pdf"],
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+  "application/vnd.ms-excel": [".xls"],
+  "text/csv": [".csv"],
+  "text/plain": [".txt", ".md"],
+  "text/markdown": [".md"],
+  "text/html": [".html", ".htm"],
+  "image/jpeg": [".jpg", ".jpeg"],
+  "image/png": [".png"],
+  "image/bmp": [".bmp"],
+  "image/tiff": [".tiff"],
+  "image/gif": [".gif"],
+};
+
+const FORMAT_HINT = "PDF, Word, PowerPoint, Excel, CSV, TXT, HTML, Images";
+
 export default function UploadZone({ onSuccess }) {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -33,7 +52,7 @@ export default function UploadZone({ onSuccess }) {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: ACCEPTED_TYPES,
     maxSize: 50 * 1024 * 1024,
     multiple: false,
     disabled: uploading,
@@ -44,7 +63,7 @@ export default function UploadZone({ onSuccess }) {
       <div
         {...getRootProps()}
         className={cn(
-          "flex flex-col items-center justify-center w-full max-w-md rounded-2xl border-2 border-dashed transition-all cursor-pointer p-10 text-center",
+          "flex flex-col items-center justify-center w-full max-w-lg rounded-2xl border-2 border-dashed transition-all cursor-pointer p-10 text-center",
           isDragActive
             ? "border-indigo-500 bg-indigo-50"
             : "border-slate-300 hover:border-indigo-400 hover:bg-slate-50 bg-white",
@@ -75,16 +94,16 @@ export default function UploadZone({ onSuccess }) {
                 : <Upload className="h-7 w-7 text-indigo-600" />}
             </div>
             <p className="text-base font-semibold text-slate-800 mb-1">
-              {isDragActive ? "Drop your PDF here" : "Upload a PDF"}
+              {isDragActive ? "Drop your document here" : "Upload a Document"}
             </p>
             <p className="text-sm text-slate-500">Drag & drop or click to browse</p>
-            <p className="text-xs text-slate-400 mt-2">PDF only, max 50 MB</p>
+            <p className="text-xs text-slate-400 mt-2">{FORMAT_HINT} · max 50 MB</p>
           </>
         )}
       </div>
 
       {error && (
-        <div className="mt-4 flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700 max-w-md w-full">
+        <div className="mt-4 flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700 max-w-lg w-full">
           <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
         </div>

@@ -6,10 +6,31 @@ import os as _os
 import threading
 import logging
 import time
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+
+# defusedxml hardens the stdlib XML parsers against entity-expansion / XXE
+# attacks (relevant to zip+XML Office formats). Best-effort: parsers that use
+# lxml directly aren't covered, but this closes the ElementTree path.
+try:
+    from defusedxml import defuse_stdlib as _defuse_stdlib
+    _defuse_stdlib()
+except Exception:  # pragma: no cover - defusedxml optional
+    pass
+
+# slowapi provides per-client rate limiting.
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
+    _SLOWAPI_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _SLOWAPI_AVAILABLE = False
 
 from app.config.settings import get_settings
 from app.database.base import init_db
@@ -33,7 +54,31 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# Default limit applies to every route (per client IP). Tune via
+# RATE_LIMIT_REQUESTS / RATE_LIMIT_WINDOW.
+if _SLOWAPI_AVAILABLE:
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=[f"{settings.rate_limit_requests} per {settings.rate_limit_window} seconds"],
+    )
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+else:
+    logger.warning("slowapi not installed — rate limiting disabled. Run: pip install slowapi")
+
+# ── Trusted hosts ─────────────────────────────────────────────────────────────
+# Rejects requests with an unexpected Host header (defends against host-header
+# injection / cache poisoning). Disabled if ALLOWED_HOSTS is empty.
+_allowed_hosts = [h.strip() for h in settings.allowed_hosts.split(",") if h.strip()]
+if _allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Pin to explicit origins. The previous wildcard ``*.vercel.app`` regex allowed
+# ANY vercel-hosted site to make credentialed calls — removed. Set extra origins
+# via CORS_ALLOWED_ORIGINS (comma-separated) or a tight CORS_ALLOWED_ORIGIN_REGEX.
 _CORS_ORIGINS = [
     "http://localhost:8501",
     "http://127.0.0.1:8501",
@@ -43,38 +88,50 @@ _CORS_ORIGINS = [
 _frontend_url = _os.getenv("FRONTEND_URL")
 if _frontend_url:
     _CORS_ORIGINS.append(_frontend_url)
+_CORS_ORIGINS += [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=settings.cors_allowed_origin_regex or None,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 @app.middleware("http")
-async def add_process_time(request: Request, call_next):
+async def add_security_headers(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     elapsed = time.perf_counter() - start
     response.headers["X-Process-Time"] = f"{elapsed:.3f}s"
+    # Baseline security headers
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+    )
     return response
 
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"Unhandled error on {request.method} {request.url}: {exc}")
-    # Starlette's ServerErrorMiddleware runs OUTSIDE CORSMiddleware, so error
-    # responses that reach here would normally be missing CORS headers.
-    # We add them manually so the browser can read the error detail.
-    response = JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)},
+    # Log the full detail server-side with a correlation id, but return only a
+    # generic message to the client so internal details aren't leaked.
+    correlation_id = uuid.uuid4().hex[:12]
+    logger.exception(
+        f"[{correlation_id}] Unhandled error on {request.method} {request.url}: {exc}"
     )
+    content = {"error": "Internal server error", "correlation_id": correlation_id}
+    if settings.debug:
+        content["detail"] = str(exc)
+    response = JSONResponse(status_code=500, content=content)
+    # Starlette's ServerErrorMiddleware runs OUTSIDE CORSMiddleware, so add CORS
+    # headers here — but only for origins we actually allow.
     origin = request.headers.get("origin", "")
-    if origin:
+    if origin and origin in _CORS_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"

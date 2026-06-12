@@ -1,6 +1,7 @@
 """
-Document service: orchestrates PDF processing, RAG indexing, classification,
+Document service: orchestrates document processing, RAG indexing, classification,
 summarization, metadata extraction, table extraction, and chat (single + multi-doc).
+Supports PDF, Word, PowerPoint, Excel, CSV, plain text, HTML, and images.
 """
 
 import uuid
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.models.document import Document, ChatMessage
-from app.utils.pdf_utils import extract_pdf, validate_pdf, PDFValidationError
+from app.utils.doc_utils import extract_document, validate_document, DocumentExtractionError as PDFValidationError
 from app.rag.chunker import chunk_pages, TextChunk
 from app.rag.vectorstore import index_chunks, retrieve_chunks, retrieve_chunks_multi, delete_collection
 from app.services.llm_service import LLMService, LLMError
@@ -49,7 +50,9 @@ class DocumentService:
 
         upload_dir = settings.upload_dir
         upload_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = f"{doc_id}.pdf"
+        # Preserve original extension so format-specific extractors can open the file
+        ext = Path(original_filename).suffix.lower() or ".bin"
+        safe_name = f"{doc_id}{ext}"
         file_path = upload_dir / safe_name
         file_path.write_bytes(file_bytes)
         logger.info(f"[Upload] File saved to disk: {file_path}")
@@ -64,13 +67,13 @@ class DocumentService:
         logger.info("[Upload] DB record created (status=processing)")
 
         try:
-            logger.info("[Upload] Step 1/5 - Validating PDF...")
-            validate_pdf(file_path, original_filename)
+            logger.info("[Upload] Step 1/5 - Validating document...")
+            validate_document(file_path, original_filename)
             logger.info("[Upload] Validation passed")
 
             logger.info("[Upload] Step 2/5 - Extracting text, tables, and metadata...")
             t_extract = time.perf_counter()
-            pdf_content = extract_pdf(file_path, original_filename)
+            pdf_content = extract_document(file_path, original_filename)
             logger.info(
                 f"[Upload] Extraction done in {time.perf_counter()-t_extract:.1f}s  "
                 f"pages={pdf_content.page_count}  "
@@ -97,16 +100,16 @@ class DocumentService:
             if pdf_content.is_scanned and pdf_content.extraction_method != "ocr":
                 doc.status = "error"
                 doc.error_message = (
-                    "Scanned PDF detected and OCR is not available. "
-                    "Install pytesseract to process scanned PDFs."
+                    "Scanned document detected and OCR is not available. "
+                    "Install pytesseract to process scanned documents."
                 )
                 self.db.commit()
-                logger.warning("[Upload] ABORTED - scanned PDF, OCR unavailable")
+                logger.warning("[Upload] ABORTED - scanned document, OCR unavailable")
                 return doc
 
             if not pdf_content.full_text.strip():
                 doc.status = "error"
-                doc.error_message = "Could not extract any text from this PDF."
+                doc.error_message = "Could not extract any text from this document."
                 self.db.commit()
                 logger.warning("[Upload] ABORTED - no text extracted")
                 return doc
@@ -310,23 +313,40 @@ class DocumentService:
             context_parts.append(f"[Chunk {i} | {doc_name} | Page {c['page_number']}]\n{c['text']}")
         context = "\n\n---\n\n".join(context_parts) if context_parts else ""
 
-        if not chunks:
+        # Apply same relevance threshold as single-doc chat
+        threshold = settings.min_relevance_score
+        relevant_chunks = [c for c in chunks if c.get("relevance_score", 0) >= threshold]
+
+        if not relevant_chunks:
             answer = "I could not find relevant information across the selected documents."
             citations = []
         else:
+            # Rebuild context from only the relevant chunks
+            context_parts = []
+            for i, c in enumerate(relevant_chunks, 1):
+                doc_name = c.get("document_name", "Unknown")
+                context_parts.append(f"[Chunk {i} | {doc_name} | Page {c['page_number']}]\n{c['text']}")
+            context = "\n\n---\n\n".join(context_parts)
+
             prompt = QA_USER_PROMPT.format(context=context, history="", question=user_message)
             answer = self.llm.complete(prompt, system_prompt=QA_SYSTEM_PROMPT, temperature=0.1)
-            citations = [
-                {
-                    "page": c["page_number"],
-                    "text": c["text"][:300] + ("..." if len(c["text"]) > 300 else ""),
-                    "chunk_id": c["chunk_id"],
-                    "relevance_score": c["relevance_score"],
-                    "document_id": c.get("doc_id", ""),
-                    "document_name": c.get("document_name", ""),
-                }
-                for c in chunks[:3]
-            ]
+
+            # Clear citations if LLM answered "not found"
+            answer_lower = answer.strip().lower()
+            if any(phrase in answer_lower for phrase in self._NOT_FOUND_PHRASES):
+                citations = []
+            else:
+                citations = [
+                    {
+                        "page": c["page_number"],
+                        "text": c["text"][:300] + ("..." if len(c["text"]) > 300 else ""),
+                        "chunk_id": c["chunk_id"],
+                        "relevance_score": round(c["relevance_score"], 3),
+                        "document_id": c.get("doc_id", ""),
+                        "document_name": c.get("document_name", ""),
+                    }
+                    for c in relevant_chunks[:3]
+                ]
 
         msg_id = str(uuid.uuid4())
         return {"message_id": msg_id, "answer": answer, "citations": citations, "sources_found": bool(chunks)}
@@ -356,14 +376,38 @@ class DocumentService:
     # Private helpers
     # --------------------------------------------------------------------------
 
+    # Phrases the LLM uses (per the system prompt) when it cannot answer.
+    # If the answer starts with or contains any of these, citations are cleared.
+    _NOT_FOUND_PHRASES = (
+        "i could not find this information",
+        "i could not find the information",
+        "not found in the document",
+        "not mentioned in the document",
+        "not present in the document",
+        "no information about",
+        "no relevant information",
+    )
+
     def _generate_answer(self, chunks, user_message, doc_id, include_history):
-        if not chunks:
+        # --- Layer 1: relevance threshold ---
+        # ChromaDB always returns top_k results even when nothing is relevant.
+        # Drop any chunk whose cosine similarity is below the configured minimum
+        # so we never pass irrelevant context to the LLM or return it as a citation.
+        threshold = settings.min_relevance_score
+        relevant_chunks = [c for c in chunks if c.get("relevance_score", 0) >= threshold]
+
+        if not relevant_chunks:
+            scores = [round(c.get("relevance_score", 0), 3) for c in chunks]
+            logger.info(
+                f"[Chat] All {len(chunks)} retrieved chunks below relevance threshold "
+                f"({threshold}) — scores: {scores}. Returning 'not found'."
+            )
             return "I could not find this information in the document.", []
 
-        for i, c in enumerate(chunks, 1):
-            logger.info(f"[Chat] Chunk {i} (page={c['page_number']} score={c['relevance_score']:.3f}): {c['text'][:100]}...")
+        for i, c in enumerate(relevant_chunks, 1):
+            logger.info(f"[Chat] Using chunk {i} (page={c['page_number']} score={c['relevance_score']:.3f}): {c['text'][:100]}...")
 
-        context_parts = [f"[Chunk {i} | Page {c['page_number']}]\n{c['text']}" for i, c in enumerate(chunks, 1)]
+        context_parts = [f"[Chunk {i} | Page {c['page_number']}]\n{c['text']}" for i, c in enumerate(relevant_chunks, 1)]
         context = "\n\n---\n\n".join(context_parts)
         history = self._format_history(doc_id, last_n=6) if include_history else ""
 
@@ -379,6 +423,17 @@ class DocumentService:
         )
         answer = self.llm.complete(prompt, system_prompt=QA_SYSTEM_PROMPT, temperature=0.1)
 
+        # --- Layer 2: post-answer check ---
+        # Even when chunks passed the threshold, the LLM may correctly judge that
+        # they don't actually answer the question.  If the LLM's answer is a
+        # "not found" response, return empty citations rather than attaching
+        # misleading sources.
+        answer_lower = answer.strip().lower()
+        if any(phrase in answer_lower for phrase in self._NOT_FOUND_PHRASES):
+            logger.info("[Chat] LLM answered 'not found' — returning empty citations.")
+            return answer, []
+
+        # Only attach chunks that cleared the relevance threshold (max 3)
         citations = [
             {
                 "page": c["page_number"],
@@ -386,7 +441,7 @@ class DocumentService:
                 "chunk_id": c["chunk_id"],
                 "relevance_score": round(c["relevance_score"], 3),
             }
-            for c in chunks[:3]
+            for c in relevant_chunks[:3]
         ]
         return answer, citations
 
@@ -435,7 +490,6 @@ def _make_table_chunks(tables, doc_id: str, start_index: int) -> list:
         chunks.append(
             TextChunk(
                 chunk_id=f"{doc_id}_table_{start_index + i}",
-                doc_id=doc_id,
                 text=text,
                 page_number=table.page_number,
                 chunk_index=start_index + i,

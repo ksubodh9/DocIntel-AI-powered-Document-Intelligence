@@ -14,7 +14,7 @@ export default function ComparePanel({ documents = [] }) {
 
   const docOptions = documents.map((d) => ({
     id: d.id,
-    name: (d.original_filename || d.filename || "Untitled").replace(/\.pdf$/i, ""),
+    name: (d.original_filename || d.filename || "Untitled").replace(/\.[^.]+$/, ""),
   }));
 
   const run = async () => {

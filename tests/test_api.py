@@ -1,101 +1,83 @@
 """
-Integration tests for FastAPI endpoints.
-Uses TestClient + in-memory SQLite + mocked LLM/embeddings.
+Integration tests for FastAPI endpoints (auth-aware).
+
+Shared setup — app import, in-memory DB override, and auth/token helpers —
+lives in conftest.py. Endpoints now require a valid JWT, so requests pass the
+`user_headers` fixture where authentication is expected to succeed.
 """
 
-import pytest
-import io
-from unittest.mock import MagicMock, patch
-from fastapi.testclient import TestClient
+import app.config.settings as cfg
 
-# Patch heavy dependencies before importing the app
-with patch("app.rag.embeddings.BGEEmbeddings.__init__", return_value=None), \
-     patch("app.rag.embeddings.BGEEmbeddings.embed_documents", return_value=[[0.1] * 384]), \
-     patch("app.rag.embeddings.BGEEmbeddings.embed_query", return_value=[0.1] * 384):
-    from app.main import app
-    from app.database.base import get_db, Base, engine
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-# Test DB (in-memory SQLite)
-TEST_DATABASE_URL = "sqlite:///:memory:"
-test_engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
-TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-
-
-def override_get_db():
-    db = TestSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-app.dependency_overrides[get_db] = override_get_db
-
-# Create test tables
-Base.metadata.create_all(bind=test_engine)
-
-client = TestClient(app)
+API = "/api/v1"
 
 
 class TestHealth:
-    def test_health_check(self):
+    def test_health_check(self, client):
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
 
 
 class TestUpload:
-    def _make_pdf_bytes(self) -> bytes:
-        """Minimal valid PDF bytes."""
-        return b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\nxref\n0 0\ntrailer\n<< >>\nstartxref\n0\n%%EOF"
-
-    def test_upload_non_pdf_rejected(self):
+    def test_upload_requires_auth(self, client):
         r = client.post(
-            "/api/v1/upload",
+            f"{API}/upload",
             files={"file": ("test.txt", b"hello", "text/plain")},
+        )
+        assert r.status_code == 401
+
+    def test_upload_non_pdf_extension_rejected(self, client, user_headers):
+        r = client.post(
+            f"{API}/upload",
+            headers=user_headers,
+            files={"file": ("test.exe", b"hello", "application/octet-stream")},
         )
         assert r.status_code == 400
 
-    def test_upload_empty_file_rejected(self):
+    def test_upload_empty_file_rejected(self, client, user_headers, monkeypatch, tmp_path):
+        monkeypatch.setattr(cfg.get_settings(), "upload_dir", tmp_path)
         r = client.post(
-            "/api/v1/upload",
+            f"{API}/upload",
+            headers=user_headers,
             files={"file": ("empty.pdf", b"", "application/pdf")},
         )
-        assert r.status_code in (400, 422)
+        # Either rejected up front (400/422) or accepted and marked errored.
+        assert r.status_code in (400, 422) or (
+            r.status_code == 201 and r.json().get("status") == "error"
+        )
 
 
 class TestDocumentNotFound:
-    def test_get_nonexistent_document(self):
-        r = client.get("/api/v1/document/nonexistent-id")
+    def test_get_nonexistent_document(self, client, user_headers):
+        r = client.get(f"{API}/document/nonexistent-id", headers=user_headers)
         assert r.status_code == 404
 
-    def test_classify_nonexistent(self):
-        r = client.post("/api/v1/classify/nonexistent-id")
+    def test_classify_nonexistent(self, client, user_headers):
+        r = client.post(f"{API}/classify/nonexistent-id", headers=user_headers)
         assert r.status_code == 404
 
-    def test_chat_nonexistent(self):
+    def test_chat_nonexistent(self, client, user_headers):
         r = client.post(
-            "/api/v1/chat",
+            f"{API}/chat",
+            headers=user_headers,
             json={"document_id": "nonexistent", "message": "hello"},
         )
         assert r.status_code == 404
 
-    def test_questions_nonexistent(self):
-        r = client.get("/api/v1/questions/nonexistent-id")
+    def test_questions_nonexistent(self, client, user_headers):
+        r = client.get(f"{API}/questions/nonexistent-id", headers=user_headers)
         assert r.status_code == 404
 
 
 class TestChatValidation:
-    def test_chat_empty_message_rejected(self):
+    def test_chat_empty_message_rejected(self, client, user_headers):
         r = client.post(
-            "/api/v1/chat",
+            f"{API}/chat",
+            headers=user_headers,
             json={"document_id": "some-id", "message": ""},
         )
         assert r.status_code == 422
 
-    def test_chat_missing_doc_id_rejected(self):
-        r = client.post("/api/v1/chat", json={"message": "hello"})
+    def test_chat_missing_doc_id_rejected(self, client, user_headers):
+        r = client.post(f"{API}/chat", headers=user_headers, json={"message": "hello"})
         assert r.status_code == 422

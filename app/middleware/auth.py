@@ -13,51 +13,67 @@ To grant admin:
 """
 
 import os
+import base64
+import json
 import logging
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, status
 
+from app.config.settings import get_settings
+
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 # Supabase signs JWTs with the project's JWT secret (found in
-# Supabase dashboard -> Settings -> API -> JWT Secret).
-_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+# Supabase dashboard -> Settings -> API -> JWT Secret). Prefer the typed setting,
+# fall back to the raw env var for backward compatibility.
+_JWT_SECRET = settings.supabase_jwt_secret or os.environ.get("SUPABASE_JWT_SECRET", "")
 
 try:
     import jwt as pyjwt
     _JWT_AVAILABLE = True
 except ImportError:
     _JWT_AVAILABLE = False
-    logger.warning("PyJWT not installed — auth middleware will pass through without verification. Run: pip install PyJWT")
+    logger.error("PyJWT not installed — JWT signatures cannot be verified. Run: pip install PyJWT")
 
 
-def _decode_token(token: str) -> dict:
-    if not _JWT_AVAILABLE:
-        # Dev fallback: decode without verification (NOT safe for production)
-        import base64, json
+def _unverified_decode(token: str) -> dict:
+    """Decode a JWT payload WITHOUT verifying the signature. Insecure — only
+    reachable when allow_insecure_auth is explicitly enabled for local dev."""
+    try:
         payload_b64 = token.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
         return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Could not decode token.")
 
-    if not _JWT_SECRET:
-        # No JWT secret configured — fall back to unverified decode.
-        # This is safe for single-user or demo deployments where auth is
-        # optional. Production deployments MUST set SUPABASE_JWT_SECRET.
-        logger.warning("SUPABASE_JWT_SECRET not set — decoding JWT without verification.")
-        import base64, json as _json
-        try:
-            payload_b64 = token.split(".")[1]
-            payload_b64 += "=" * (-len(payload_b64) % 4)
-            return _json.loads(base64.urlsafe_b64decode(payload_b64))
-        except Exception:
-            raise HTTPException(status_code=401, detail="Could not decode token (SUPABASE_JWT_SECRET not set).")
+
+def _decode_token(token: str) -> dict:
+    # Fail closed: without PyJWT or a configured secret, we cannot verify the
+    # signature. We only permit unverified decoding when an operator has
+    # explicitly opted in via ALLOW_INSECURE_AUTH (intended for local dev).
+    if not _JWT_AVAILABLE or not _JWT_SECRET:
+        if settings.allow_insecure_auth:
+            logger.warning(
+                "ALLOW_INSECURE_AUTH is on — decoding JWT WITHOUT signature "
+                "verification. Never use this in production."
+            )
+            return _unverified_decode(token)
+        logger.error(
+            "Refusing to accept token: SUPABASE_JWT_SECRET not set or PyJWT "
+            "missing, and ALLOW_INSECURE_AUTH is disabled."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication is not configured on the server.",
+        )
 
     try:
         return pyjwt.decode(
             token,
             _JWT_SECRET,
-            algorithms=["HS256"],
+            algorithms=["HS256"],   # pinned — rejects alg=none and asymmetric confusion
             options={"verify_aud": False},   # Supabase tokens don't always have aud
         )
     except pyjwt.ExpiredSignatureError:

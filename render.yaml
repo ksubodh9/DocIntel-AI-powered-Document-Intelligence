@@ -29,12 +29,17 @@ services:
         sync: false   # set in Render dashboard (Supabase PostgreSQL connection string)
 
       # --- Supabase Auth ---
+      # SUPABASE_JWT_SECRET is now MANDATORY: the backend fails closed and
+      # rejects all tokens if it is unset (no more unverified decode).
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      # Keep OFF in production. Only enable for local/dev where auth is mocked.
+      - key: ALLOW_INSECURE_AUTH
+        value: "false"
 
       # --- LLM ---
       - key: LLM_PROVIDER
@@ -49,9 +54,33 @@ services:
         value: /data/vectorstore
 
       # --- CORS ---
+      # The wildcard *.vercel.app rule was removed. Pin your real frontend
+      # origin(s). FRONTEND_URL is included automatically; add extras here.
       - key: FRONTEND_URL
         sync: false   # e.g. https://pdf-agent.vercel.app
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false   # optional, comma-separated extra origins
+      # Optional TIGHT regex for Vercel preview deploys (leave unset to disable):
+      #   ^https://pdf-agent-[a-z0-9]+\.vercel\.app$
+      - key: CORS_ALLOWED_ORIGIN_REGEX
+        sync: false
+
+      # --- Trusted hosts (optional) ---
+      # Comma-separated Host values. Leave unset to allow all. If you set it,
+      # include your Render host, e.g. pdf-agent-backend.onrender.com
+      - key: ALLOWED_HOSTS
+        sync: false
 
       # --- App ---
       - key: MAX_FILE_SIZE_MB
         value: "50"
+      - key: MAX_QUESTION_LENGTH
+        value: "4000"
+      - key: MAX_DECOMPRESSION_RATIO
+        value: "120"
+
+      # --- Rate limiting (per client IP; in-memory, per-instance) ---
+      - key: RATE_LIMIT_REQUESTS
+        value: "60"
+      - key: RATE_LIMIT_WINDOW
+        value: "60"

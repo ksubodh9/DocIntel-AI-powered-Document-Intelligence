@@ -19,7 +19,7 @@ Endpoints:
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, Request
 from fastapi import status as http_status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
@@ -28,7 +28,7 @@ from app.database.base import get_db
 from app.services.llm_service import get_llm_service, LLMService, LLMError
 from app.services.document_service import DocumentService
 from app.rag.vectorstore import delete_collection
-from app.middleware.auth import get_optional_user
+from app.middleware.auth import get_current_user
 from app.models.usage import UsageEvent
 from app.schemas.document import (
     UploadResponse,
@@ -76,9 +76,17 @@ def _track(db: Session, user: Optional[dict], event_type: str, doc_id: Optional[
         pass  # analytics must never break the main request
 
 
-def _get_doc_or_404(doc_id: str, svc: DocumentService):
+def _get_doc_or_404(doc_id: str, svc: DocumentService, user: dict):
+    """Fetch a document and enforce ownership.
+
+    Returns 404 (not 403) when the document belongs to another user so the
+    endpoint never confirms the existence of resources the caller can't access.
+    Admins bypass the ownership check.
+    """
     doc = svc.get_document(doc_id)
     if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+    if not user.get("is_admin") and doc.user_id != user.get("user_id"):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
     return doc
 
@@ -99,37 +107,59 @@ def _require_ready(doc):
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=UploadResponse, status_code=201)
-async def upload_pdf(
+async def upload_document(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     svc: DocumentService = Depends(get_document_service),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
     """
-    Upload a PDF document.
+    Upload a document (PDF, Word, PowerPoint, Excel, CSV, TXT, Markdown, HTML, or image).
     The file is validated, text is extracted, and chunks are indexed in ChromaDB.
     """
-    # Validate content type
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        if not (file.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(
-                status_code=400,
-                detail="Only PDF files are supported. Please upload a .pdf file.",
-            )
+    from app.utils.doc_utils import SUPPORTED_EXTENSIONS
+    from pathlib import Path as _Path
 
-    # Read file bytes (size check happens inside service)
-    file_bytes = await file.read()
+    filename = file.filename or "document"
+    ext = _Path(filename).suffix.lower()
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Supported formats: {supported}",
+        )
+
     max_bytes = settings.max_file_size_mb * 1024 * 1024
-    if len(file_bytes) > max_bytes:
+
+    # Early rejection: refuse oversized uploads via Content-Length BEFORE reading
+    # the body into memory, so a huge payload can't exhaust RAM.
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > max_bytes:
         raise HTTPException(
             status_code=413,
             detail=f"File too large. Maximum size is {settings.max_file_size_mb} MB.",
         )
 
-    # save_upload does blocking work (disk write, PDF parse, embedding) -
+    # Read body in bounded chunks and abort as soon as the limit is exceeded
+    # (Content-Length can be absent or spoofed, so we also enforce while reading).
+    file_bytes = b""
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        file_bytes += chunk
+        if len(file_bytes) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {settings.max_file_size_mb} MB.",
+            )
+
+    # save_upload does blocking work (disk write, extraction, embedding) -
     # run it in a worker thread so the event loop (and /health) stays responsive.
-    user_id = user.get("user_id") if user else None
-    doc = await run_in_threadpool(svc.save_upload, file_bytes, file.filename or "document.pdf", user_id)
+    user_id = user.get("user_id")
+    doc = await run_in_threadpool(svc.save_upload, file_bytes, filename, user_id)
 
     _track(svc.db, user, "upload", doc.id)
     return UploadResponse(
@@ -139,7 +169,7 @@ async def upload_pdf(
         page_count=doc.page_count,
         status=doc.status,
         message=(
-            "PDF uploaded and indexed successfully."
+            "Document uploaded and indexed successfully."
             if doc.status == "ready"
             else doc.error_message or "Processing failed."
         ),
@@ -157,9 +187,9 @@ async def upload_pdf(
 def classify_document(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     _require_ready(doc)
 
     try:
@@ -181,9 +211,9 @@ def classify_document(
 def summarize_document(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     _require_ready(doc)
 
     try:
@@ -210,10 +240,17 @@ def summarize_document(
 def chat_with_document(
     request: ChatRequest,
     svc: DocumentService = Depends(get_document_service),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(request.document_id, svc)
+    doc = _get_doc_or_404(request.document_id, svc, user)
     _require_ready(doc)
+
+    # Cap question length to limit prompt-injection surface and token abuse.
+    if len(request.message or "") > settings.max_question_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question too long. Maximum is {settings.max_question_length} characters.",
+        )
 
     try:
         result = svc.chat(doc, request.message, request.include_history)
@@ -222,7 +259,8 @@ def chat_with_document(
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[Chat] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"message": f"Chat failed: {type(e).__name__}: {e}"})
+        # Don't leak internal exception detail to the client.
+        raise HTTPException(status_code=500, detail={"message": "Chat failed due to an internal error."})
 
     _track(svc.db, user, "chat", request.document_id)
     citations = [Citation(**c) for c in result["citations"]]
@@ -241,8 +279,9 @@ def chat_with_document(
 def get_document(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     return DocumentDetail.model_validate(doc)
 
 
@@ -252,8 +291,9 @@ def get_document(
 def get_chat_history(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    _get_doc_or_404(doc_id, svc)
+    _get_doc_or_404(doc_id, svc, user)
     messages = svc.get_chat_history(doc_id)
     return ChatHistoryResponse(
         document_id=doc_id,
@@ -267,8 +307,9 @@ def get_chat_history(
 def get_suggested_questions(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     _require_ready(doc)
 
     if not doc.suggested_questions:
@@ -289,8 +330,9 @@ def get_suggested_questions(
 def extract_metadata(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     _require_ready(doc)
     try:
         doc = svc.extract_metadata(doc)
@@ -305,8 +347,9 @@ def extract_metadata(
 def get_tables(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     _require_ready(doc)
     raw_tables = doc.tables or []
     tables = [TableItem(page=t["page"], caption=t["caption"], markdown=t["markdown"]) for t in raw_tables]
@@ -319,13 +362,18 @@ def get_tables(
 def multi_chat(
     request: MultiChatRequest,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    # Validate all documents exist and are ready
+    if len(request.message or "") > settings.max_question_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question too long. Maximum is {settings.max_question_length} characters.",
+        )
+
+    # Validate all documents exist, are owned by the caller, and are ready
     doc_map = {}
     for doc_id in request.document_ids:
-        doc = svc.get_document(doc_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+        doc = _get_doc_or_404(doc_id, svc, user)
         if doc.status != "ready":
             raise HTTPException(status_code=409, detail=f"Document '{doc_id}' is not ready (status: {doc.status}).")
         doc_map[doc_id] = doc
@@ -351,13 +399,10 @@ def multi_chat(
 def compare_documents(
     request: CompareRequest,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc_a = svc.get_document(request.document_id_a)
-    doc_b = svc.get_document(request.document_id_b)
-    if not doc_a:
-        raise HTTPException(status_code=404, detail=f"Document A '{request.document_id_a}' not found.")
-    if not doc_b:
-        raise HTTPException(status_code=404, detail=f"Document B '{request.document_id_b}' not found.")
+    doc_a = _get_doc_or_404(request.document_id_a, svc, user)
+    doc_b = _get_doc_or_404(request.document_id_b, svc, user)
     if doc_a.status != "ready":
         raise HTTPException(status_code=409, detail=f"Document A is not ready (status: {doc_a.status}).")
     if doc_b.status != "ready":
@@ -380,9 +425,10 @@ def compare_documents(
 @router.get("/documents", response_model=list[DocumentDetail])
 def list_documents(
     svc: DocumentService = Depends(get_document_service),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
-    user_id = user.get("user_id") if user else None
+    # Admins see everything; regular users only their own documents.
+    user_id = None if user.get("is_admin") else user.get("user_id")
     docs = svc.get_all_ready_documents(user_id=user_id)
     return [DocumentDetail.model_validate(d) for d in docs]
 
@@ -393,8 +439,9 @@ def list_documents(
 def delete_document(
     doc_id: str,
     svc: DocumentService = Depends(get_document_service),
+    user: dict = Depends(get_current_user),
 ):
-    doc = _get_doc_or_404(doc_id, svc)
+    doc = _get_doc_or_404(doc_id, svc, user)
     from pathlib import Path
 
     # Delete file
