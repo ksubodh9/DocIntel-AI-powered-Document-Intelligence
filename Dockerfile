@@ -35,6 +35,8 @@ ENV OMP_NUM_THREADS=2 \
     MKL_NUM_THREADS=2 \
     TOKENIZERS_PARALLELISM=false
 
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Listen on $PORT when provided, else 7860 (Hugging Face Spaces' default port).
+# Render overrides the start command with its own $PORT; docker-compose sets
+# PORT=8000 explicitly. Shell form so ${PORT} is expanded at runtime.
+EXPOSE 7860
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860}

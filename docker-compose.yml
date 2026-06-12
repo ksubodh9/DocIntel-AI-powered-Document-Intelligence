@@ -27,6 +27,9 @@ services:
     env_file:
       - .env
     environment:
+      # Keep the container on 8000 locally (matches the port mapping + healthcheck);
+      # the image defaults to 7860 (Hugging Face) when PORT is unset.
+      - PORT=8000
       - DATABASE_URL=sqlite:////app/data/db/pdf_agent.db
       - OLLAMA_HOST=host.docker.internal
       - OLLAMA_PORT=11434
