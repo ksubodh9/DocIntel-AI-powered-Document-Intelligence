@@ -16,19 +16,14 @@ RUN apt-get update && apt-get install -y \
 
 # Install Python dependencies.
 # - A BuildKit cache mount (/root/.cache/pip) keeps downloaded wheels between
-#   builds, so rebuilds don't re-download multi-GB packages. (Needs the
-#   `# syntax` line above and BuildKit, which is the default in modern Docker.)
-# - torch is installed FIRST from the CPU-only wheel index. The default PyPI
-#   torch pulls ~2-3 GB of NVIDIA CUDA packages we don't use (we run on CPU),
-#   so this is the single biggest build-time and image-size saving. Installing
-#   it up front means `-r requirements.txt` sees torch already satisfied and
-#   won't pull the CUDA build.
+#   builds, so rebuilds don't re-download packages. (Needs the `# syntax` line
+#   above and BuildKit, which is the default in modern Docker.)
+# - Embeddings run via fastembed/onnxruntime (no torch), so there's no multi-GB
+#   CUDA download — the image is small and builds fast.
 # - --retries / --timeout make the install resilient to slow/flaky downloads.
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install --retries 5 --timeout 120 \
-        torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --retries 5 --timeout 120 -r requirements.txt
 
 # Copy source

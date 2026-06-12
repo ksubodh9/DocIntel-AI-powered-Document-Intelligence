@@ -1,7 +1,12 @@
 """
 Embedding model wrapper.
-Default: BAAI/bge-small-en-v1.5 via sentence-transformers.
-Modular: swap to OpenAI embeddings by changing EMBEDDING_PROVIDER in .env.
+Default: BAAI/bge-small-en-v1.5 via fastembed (ONNX runtime).
+
+fastembed replaces torch + sentence-transformers: it runs the same model on
+onnxruntime (which ChromaDB already bundles), cutting the image size and RAM
+footprint by well over a gigabyte. That's what lets the backend fit on small
+free tiers. The public interface (embed_documents / embed_query) is unchanged,
+so the chunker, vectorstore, and document service are untouched.
 
 BGE models prepend a query instruction for retrieval queries:
   "Represent this sentence for searching relevant passages: <query>"
@@ -21,35 +26,45 @@ class EmbeddingModel(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
-# ── HuggingFace / Sentence-Transformers Embeddings ───────────────────────────
+# ── HuggingFace / fastembed (ONNX) Embeddings ────────────────────────────────
 
 class BGEEmbeddings:
     """
-    BAAI/bge-small-en-v1.5 — fast, lightweight, 384-dim.
-    Uses the recommended query prefix for retrieval tasks.
+    BAAI/bge-small-en-v1.5 — fast, lightweight, 384-dim, served via fastembed.
+    Uses the recommended query prefix for retrieval tasks. Vectors are
+    L2-normalized so cosine similarity in ChromaDB behaves as before.
     """
 
     BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
     def __init__(self, model_name: str = settings.embedding_model, device: str = settings.embedding_device):
         import logging
-        from sentence_transformers import SentenceTransformer
+        from fastembed import TextEmbedding
         _log = logging.getLogger(__name__)
-        _log.info(f"[Embeddings] Loading model '{model_name}' on {device} (first run downloads ~130 MB)...")
+        _log.info(f"[Embeddings] Loading model '{model_name}' via fastembed (first run downloads ~130 MB)...")
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device)
+        # device is accepted for interface compatibility; fastembed runs on CPU
+        # via onnxruntime. Install fastembed-gpu to use a GPU.
+        self.model = TextEmbedding(model_name=model_name)
         self._is_bge = "bge" in model_name.lower()
         _log.info(f"[Embeddings] Model '{model_name}' loaded successfully.")
 
+    @staticmethod
+    def _normalize(vec) -> list[float]:
+        import numpy as np
+        v = np.asarray(vec, dtype="float32")
+        norm = float(np.linalg.norm(v))
+        return (v / norm).tolist() if norm else v.tolist()
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return embeddings.tolist()
+        # fastembed.embed() returns a generator of numpy arrays.
+        return [self._normalize(e) for e in self.model.embed(list(texts))]
 
     def embed_query(self, text: str) -> list[float]:
         if self._is_bge:
             text = self.BGE_QUERY_INSTRUCTION + text
-        embedding = self.model.encode([text], normalize_embeddings=True, show_progress_bar=False)
-        return embedding[0].tolist()
+        emb = next(iter(self.model.embed([text])))
+        return self._normalize(emb)
 
 
 # ── OpenAI Embeddings ─────────────────────────────────────────────────────────

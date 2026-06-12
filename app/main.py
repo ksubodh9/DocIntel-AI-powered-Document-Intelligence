@@ -87,13 +87,27 @@ _CORS_ORIGINS = [
 ]
 _frontend_url = _os.getenv("FRONTEND_URL")
 if _frontend_url:
-    _CORS_ORIGINS.append(_frontend_url)
-_CORS_ORIGINS += [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
+    _CORS_ORIGINS.append(_frontend_url.rstrip("/"))   # tolerate a trailing slash
+_CORS_ORIGINS += [o.strip().rstrip("/") for o in settings.cors_allowed_origins.split(",") if o.strip()]
+
+import re as _re
+_CORS_ORIGIN_REGEX = settings.cors_allowed_origin_regex or None
+_cors_regex_compiled = _re.compile(_CORS_ORIGIN_REGEX) if _CORS_ORIGIN_REGEX else None
+logger.info(f"CORS allowed origins: {_CORS_ORIGINS}  regex={_CORS_ORIGIN_REGEX!r}")
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in _CORS_ORIGINS:
+        return True
+    return bool(_cors_regex_compiled and _cors_regex_compiled.fullmatch(origin))
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
-    allow_origin_regex=settings.cors_allowed_origin_regex or None,
+    allow_origin_regex=_CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
@@ -129,9 +143,10 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content["detail"] = str(exc)
     response = JSONResponse(status_code=500, content=content)
     # Starlette's ServerErrorMiddleware runs OUTSIDE CORSMiddleware, so add CORS
-    # headers here — but only for origins we actually allow.
+    # headers here — for any origin we allow (exact list OR regex), so that 500s
+    # are readable cross-origin instead of surfacing as opaque CORS errors.
     origin = request.headers.get("origin", "")
-    if origin and origin in _CORS_ORIGINS:
+    if _origin_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"
