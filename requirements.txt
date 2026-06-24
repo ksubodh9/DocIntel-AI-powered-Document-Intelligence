@@ -60,3 +60,4 @@ Pillow>=10.0.0
 
 # Utilities
 python-dotenv==1.0.1
+cryptography>=42.0.0

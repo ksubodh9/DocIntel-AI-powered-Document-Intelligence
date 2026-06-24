@@ -1,5 +1,6 @@
 import axios from "axios";
 import { supabase } from "./supabase";
+import { getByokHeaders } from "./byok";
 
 const _env = (typeof window !== "undefined" && window._env_) || {};
 const BASE = _env.VITE_API_BASE || import.meta.env.VITE_API_BASE || "http://localhost:8000/api/v1";
@@ -15,6 +16,12 @@ client.interceptors.request.use(async (config) => {
     }
   } catch {
     // No auth configured or session unavailable — proceed without token
+  }
+  // BYOK: attach per-request LLM credential headers based on the user's choice.
+  try {
+    Object.assign(config.headers, getByokHeaders());
+  } catch {
+    // Never let header resolution block a request.
   }
   return config;
 });
@@ -127,4 +134,32 @@ export async function getAdminUsers() {
 export async function getAdminUserDocuments(userId) {
   const { data } = await client.get(`/admin/users/${userId}/documents`);
   return data;
+}
+
+// ── BYOK credentials ──────────────────────────────────────────────────────────
+
+export async function getSessionMode() {
+  const { data } = await client.get("/session/mode");
+  return data;
+}
+
+export async function validateCredential({ provider, api_key, model }) {
+  const { data } = await client.post("/credentials/validate",
+    { provider, api_key, model }, { timeout: 60_000 });
+  return data;
+}
+
+export async function saveCredential({ provider, api_key, model, validate_first = true }) {
+  const { data } = await client.post("/credentials",
+    { provider, api_key, model, validate_first }, { timeout: 60_000 });
+  return data;
+}
+
+export async function listCredentials() {
+  const { data } = await client.get("/credentials");
+  return data;
+}
+
+export async function deleteCredential(provider) {
+  await client.delete(`/credentials/${provider}`);
 }

@@ -1,20 +1,29 @@
 """
 LLM service - adapter layer over multiple providers.
 
-Fallback chain:
+Credentials & configuration
+---------------------------
+The service is driven by an ``LLMConfig`` value object (provider, keys, models,
+fallback chain) rather than reading the global settings singleton directly. This
+is what makes Bring-Your-Own-Key possible: a request can supply its own
+``LLMConfig`` while the default still comes from the server's .env.
+
+  * ``LLMConfig.from_settings(settings)`` — server defaults (current behaviour).
+  * ``LLMConfig.for_byok(provider, api_key, model)`` — a single user-supplied
+    provider/key, with no cross-provider fallback.
+
+Fallback chain (server mode):
   Set LLM_FALLBACK_CHAIN=groq,ollama to automatically retry with the next
   provider when the primary fails due to rate limits, auth errors, or timeouts.
-
-  For Gemini: set GEMINI_MODELS=gemini-2.5-flash,gemini-2.0-flash to try
-  multiple models in order within the same provider.
-
-  For Groq:   set GROQ_MODELS=llama-3.3-70b-versatile,llama-3.1-8b-instant
+  For Gemini set GEMINI_MODELS=...; for Groq set GROQ_MODELS=... to try several
+  models in order within the same provider.
 """
 
 import json
 import re
 import time
 import logging
+from dataclasses import dataclass, field
 from typing import Optional
 
 from app.config.settings import get_settings
@@ -23,10 +32,32 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+# Providers the service knows how to call. Any user-supplied provider name is
+# validated against this set before it can select a code path.
+ALLOWED_PROVIDERS = frozenset(
+    {"gemini", "ollama", "groq", "huggingface", "openai", "anthropic"}
+)
+
+
 # Shown to end users when anything goes wrong. Deliberately generic — it must
 # never reveal provider names, model names, API keys, or .env configuration.
 GENERIC_USER_MESSAGE = "Something went wrong while processing the document. Please try again."
 BUSY_USER_MESSAGE = "The service is busy right now. Please try again in a moment."
+
+
+# Patterns for common provider key formats. Used to redact secrets from any text
+# that might reach the logs (e.g. raw SDK exception strings).
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{6,}"      # OpenAI / Anthropic
+    r"|AIza[A-Za-z0-9_\-]{6,}"     # Google / Gemini
+    r"|gsk_[A-Za-z0-9_\-]{6,}"     # Groq
+    r"|hf_[A-Za-z0-9_\-]{6,})"     # HuggingFace
+)
+
+
+def _scrub(text) -> str:
+    """Redact anything that looks like an API key before it is logged."""
+    return _SECRET_RE.sub("***REDACTED***", str(text))
 
 
 class LLMError(Exception):
@@ -45,15 +76,114 @@ class LLMError(Exception):
         self.user_message = user_message or GENERIC_USER_MESSAGE
 
 
+# -------------------------------------------------------------------------
+# Configuration value object
+# -------------------------------------------------------------------------
+
+@dataclass
+class LLMConfig:
+    """
+    Everything the service needs to make a call, independent of global settings.
+
+    `api_keys`, `models`, and `model_lists` are keyed by provider name so the
+    server-mode fallback chain can span providers; BYOK mode populates only the
+    single provider the user supplied.
+    """
+    provider: str
+    fallback_chain: list[str] = field(default_factory=list)
+    api_keys: dict[str, str] = field(default_factory=dict)
+    models: dict[str, str] = field(default_factory=dict)
+    model_lists: dict[str, list[str]] = field(default_factory=dict)
+    ollama_host: str = "localhost"
+    ollama_port: int = 11434
+
+    def key_for(self, provider: str) -> str:
+        return self.api_keys.get(provider, "")
+
+    def models_for(self, provider: str) -> list[str]:
+        """Ordered model list to try for a provider (model_lists wins, else the single model)."""
+        lst = self.model_lists.get(provider)
+        if lst:
+            return lst
+        m = self.models.get(provider)
+        return [m] if m else []
+
+    # ---- constructors -------------------------------------------------------
+
+    @classmethod
+    def from_settings(cls, s) -> "LLMConfig":
+        """Build the default config from the server's environment settings."""
+        fallback = [p.strip().lower() for p in s.llm_fallback_chain.split(",") if p.strip()]
+        model_lists = {}
+        gem = [m.strip() for m in s.gemini_models.split(",") if m.strip()]
+        grq = [m.strip() for m in s.groq_models.split(",") if m.strip()]
+        if gem:
+            model_lists["gemini"] = gem
+        if grq:
+            model_lists["groq"] = grq
+        return cls(
+            provider=s.llm_provider,
+            fallback_chain=fallback,
+            api_keys={
+                "openai": s.openai_api_key,
+                "gemini": s.gemini_api_key,
+                "anthropic": s.anthropic_api_key,
+                "groq": s.groq_api_key,
+                "huggingface": s.huggingface_api_key,
+            },
+            models={
+                "openai": s.openai_model,
+                "gemini": s.gemini_model,
+                "anthropic": s.anthropic_model,
+                "groq": s.groq_model,
+                "huggingface": s.huggingface_model,
+                "ollama": s.ollama_model,
+            },
+            model_lists=model_lists,
+            ollama_host=s.ollama_host,
+            ollama_port=s.ollama_port,
+        )
+
+    @classmethod
+    def for_byok(cls, provider: str, api_key: str, model: Optional[str] = None) -> "LLMConfig":
+        """
+        Build a config from a single user-supplied provider + key (BYOK).
+        No cross-provider fallback: the user gave us one key, so we only use it.
+        Falls back to the server's default model for the provider when none given.
+        """
+        provider = (provider or "").strip().lower()
+        if provider not in ALLOWED_PROVIDERS:
+            raise LLMError(
+                f"Unsupported provider '{provider}'.",
+                user_message="That provider isn't supported.",
+            )
+        s = get_settings()
+        default_model = model or {
+            "openai": s.openai_model,
+            "gemini": s.gemini_model,
+            "anthropic": s.anthropic_model,
+            "groq": s.groq_model,
+            "huggingface": s.huggingface_model,
+            "ollama": s.ollama_model,
+        }.get(provider, "")
+        return cls(
+            provider=provider,
+            fallback_chain=[],
+            api_keys={provider: api_key},
+            models={provider: default_model} if default_model else {},
+            ollama_host=s.ollama_host,
+            ollama_port=s.ollama_port,
+        )
+
+
 def _classify_api_error(provider: str, exc: Exception) -> "LLMError":
-    """Convert a raw SDK exception into a clean LLMError."""
-    raw = str(exc)
+    """Convert a raw SDK exception into a clean LLMError (with secrets redacted)."""
+    raw = _scrub(exc)
     lower = raw.lower()
 
     if any(k in raw for k in ("429", "RESOURCE_EXHAUSTED")) or \
        any(k in lower for k in ("quota", "rate limit", "rate_limit", "too many requests")):
-        import re as _re
-        m = _re.search(r"retry[_ ](?:in|delay)[^\d]*(\d+\.?\d*)", raw, _re.IGNORECASE)
+        m = re.search(r"retry[_ ](?:in|delay)[^\d]*(\d+\.?\d*)", raw, re.IGNORECASE)
         wait = int(float(m.group(1))) + 1 if m else 0
         logger.debug(f"[LLM] Rate-limit from {provider}: {raw}")
         return LLMError(
@@ -66,8 +196,6 @@ def _classify_api_error(provider: str, exc: Exception) -> "LLMError":
        any(k in lower for k in ("api key", "api_key", "authentication", "unauthorized",
                                 "permission denied", "invalid api key")):
         logger.debug(f"[LLM] Auth error from {provider}: {raw}")
-        # Auth/key problems are a server-side misconfiguration — surface a
-        # generic message rather than telling the end user about .env / keys.
         return LLMError(f"Auth error ({provider}). Check {provider.upper()}_API_KEY in .env. {raw}")
 
     if "404" in raw or ("not found" in lower and "model" in lower):
@@ -116,8 +244,10 @@ def _is_fallback_worthy(err: LLMError) -> bool:
 
 
 class LLMService:
-    def __init__(self):
-        self.provider = settings.llm_provider
+    def __init__(self, config: Optional[LLMConfig] = None):
+        # Default to server settings; a caller (BYOK) may inject its own config.
+        self.cfg = config or LLMConfig.from_settings(get_settings())
+        self.provider = self.cfg.provider
 
     # -------------------------------------------------------------------------
     # Public interface
@@ -159,17 +289,18 @@ class LLMService:
     def _build_chain(self) -> list[str]:
         """Return ordered list of provider names to try."""
         chain = [self.provider]
-        if settings.llm_fallback_chain:
-            for p in settings.llm_fallback_chain.split(","):
-                p = p.strip().lower()
-                if p and p not in chain:
-                    chain.append(p)
+        for p in self.cfg.fallback_chain:
+            if p and p not in chain:
+                chain.append(p)
         return chain
 
     def _call_provider(
         self, provider: str, prompt: str, system_prompt: Optional[str],
         temperature: float, max_tokens: int,
     ) -> str:
+        if provider not in ALLOWED_PROVIDERS:
+            raise LLMError(f"Unknown provider '{provider}'. Check LLM_PROVIDER in .env.")
+
         logger.info(f"[LLM] Provider={provider}  temp={temperature}  max_tokens={max_tokens}")
         if system_prompt:
             logger.info(f"[LLM] System ({len(system_prompt)} chars): {system_prompt[:200]}")
@@ -189,8 +320,8 @@ class LLMService:
                 result = self._openai_complete(prompt, system_prompt, temperature, max_tokens)
             elif provider == "anthropic":
                 result = self._anthropic_complete(prompt, system_prompt, temperature, max_tokens)
-            else:
-                raise LLMError(f"Unknown provider '{provider}'. Check LLM_PROVIDER in .env.")
+            else:  # pragma: no cover - guarded above
+                raise LLMError(f"Unknown provider '{provider}'.")
         except LLMError:
             raise
         except Exception as e:
@@ -206,14 +337,9 @@ class LLMService:
 
     def _gemini_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         import google.generativeai as genai
-        genai.configure(api_key=settings.gemini_api_key)
+        genai.configure(api_key=self.cfg.key_for("gemini"))
 
-        # Build model list: GEMINI_MODELS (comma-sep) takes priority, else GEMINI_MODEL
-        if settings.gemini_models:
-            models = [m.strip() for m in settings.gemini_models.split(",") if m.strip()]
-        else:
-            models = [settings.gemini_model]
-
+        models = self.cfg.models_for("gemini")
         last_err: Optional[LLMError] = None
         for model_name in models:
             try:
@@ -229,7 +355,6 @@ class LLMService:
                 return response.text.strip()
             except Exception as e:
                 err = _classify_api_error("gemini", e)
-                # Only try next Gemini model on rate-limit; other errors are fatal for this provider
                 if err.retry_after > 0 or "rate limit" in str(err).lower():
                     last_err = err
                     logger.warning(f"[Gemini] {model_name} rate-limited, trying next model...")
@@ -240,7 +365,8 @@ class LLMService:
 
     def _ollama_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         import ollama
-        logger.info(f"[Ollama] Model: {settings.ollama_model}")
+        model = self.cfg.models.get("ollama") or "llama3.2:latest"
+        logger.info(f"[Ollama] Model: {model}")
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -251,7 +377,7 @@ class LLMService:
         for attempt in range(3):
             try:
                 response = ollama.chat(
-                    model=settings.ollama_model,
+                    model=model,
                     messages=current_messages,
                     options={"temperature": temperature, "num_predict": max_tokens},
                 )
@@ -279,13 +405,8 @@ class LLMService:
     def _groq_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         from groq import Groq
 
-        # Build model list: GROQ_MODELS takes priority, else GROQ_MODEL
-        if settings.groq_models:
-            models = [m.strip() for m in settings.groq_models.split(",") if m.strip()]
-        else:
-            models = [settings.groq_model]
-
-        client = Groq(api_key=settings.groq_api_key)
+        models = self.cfg.models_for("groq")
+        client = Groq(api_key=self.cfg.key_for("groq"))
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -312,8 +433,9 @@ class LLMService:
 
     def _huggingface_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         from huggingface_hub import InferenceClient
-        logger.info(f"[HuggingFace] Model: {settings.huggingface_model}")
-        client = InferenceClient(model=settings.huggingface_model, token=settings.huggingface_api_key)
+        model = self.cfg.models.get("huggingface") or "mistralai/Mistral-7B-Instruct-v0.3"
+        logger.info(f"[HuggingFace] Model: {model}")
+        client = InferenceClient(model=model, token=self.cfg.key_for("huggingface"))
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -324,15 +446,16 @@ class LLMService:
 
     def _openai_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         from openai import OpenAI
-        logger.info(f"[OpenAI] Model: {settings.openai_model}")
-        client = OpenAI(api_key=settings.openai_api_key)
+        model = self.cfg.models.get("openai") or "gpt-4o-mini"
+        logger.info(f"[OpenAI] Model: {model}")
+        client = OpenAI(api_key=self.cfg.key_for("openai"))
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         try:
             response = client.chat.completions.create(
-                model=settings.openai_model, messages=messages,
+                model=model, messages=messages,
                 temperature=temperature, max_tokens=max_tokens,
             )
             return response.choices[0].message.content.strip()
@@ -341,10 +464,11 @@ class LLMService:
 
     def _anthropic_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
         import anthropic
-        logger.info(f"[Anthropic] Model: {settings.anthropic_model}")
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        model = self.cfg.models.get("anthropic") or "claude-3-haiku-20240307"
+        logger.info(f"[Anthropic] Model: {model}")
+        client = anthropic.Anthropic(api_key=self.cfg.key_for("anthropic"))
         kwargs = dict(
-            model=settings.anthropic_model, max_tokens=max_tokens,
+            model=model, max_tokens=max_tokens,
             temperature=temperature, messages=[{"role": "user", "content": prompt}],
         )
         if system_prompt:
@@ -381,4 +505,11 @@ def extract_json(text: str) -> dict:
 
 
 def get_llm_service() -> LLMService:
+    """
+    FastAPI dependency: returns a service using the server's default config.
+
+    BYOK request resolution is layered on top of this in the API layer (Step 3),
+    which constructs an LLMService(LLMConfig.for_byok(...)) when a request carries
+    its own credentials.
+    """
     return LLMService()

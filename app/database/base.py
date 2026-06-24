@@ -52,7 +52,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db() -> None:
     """Create all tables and run lightweight schema migrations."""
-    from app.models import document, usage   # noqa: F401 — registers models
+    from app.models import document, usage, user_credential   # noqa: F401 — registers models
     Base.metadata.create_all(bind=engine)
     _migrate_schema()
 
@@ -86,6 +86,7 @@ def _migrate_schema() -> None:
             ("collection_name",            "VARCHAR(255)"),
             ("updated_at",                 "DATETIME"),
         ],
+        "user_credentials": [],
         "usage_events": [
             # usage_events was added later; create_all handles the table itself,
             # but list any future columns here if needed.
