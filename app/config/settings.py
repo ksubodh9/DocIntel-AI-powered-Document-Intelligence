@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     #   ≥ 0.5  clearly relevant   0.35–0.5  possibly relevant   < 0.35  likely noise
     min_relevance_score: float = 0.35
 
+    # Re-ranking (retrieve-then-rerank). When enabled, the vector store over-fetches
+    # `rerank_candidates` chunks, a cross-encoder reorders them, and the top
+    # `top_k_retrieval` are kept. Disabled by default — adds ~50–200ms/query.
+    # The cosine `min_relevance_score` filter still applies to each returned chunk
+    # (rerank scores are unbounded logits, not cosine, so the same threshold can't
+    # apply to them). The reranker only changes ordering, not which chunks pass.
+    rerank_enabled: bool = False
+    reranker_model: str = "BAAI/bge-reranker-base"
+    rerank_candidates: int = 20  # chunks pulled from ChromaDB before reranking
+
     # Rate Limiting
     rate_limit_requests: int = 60
     rate_limit_window: int = 60  # seconds
@@ -105,6 +115,12 @@ class Settings(BaseSettings):
     # Supabase dashboard -> Settings -> API -> service_role (secret)
     supabase_service_role_key: str = Field(default="", description="Supabase service role key (admin use only)")
     supabase_url: str = Field(default="", description="https://your-project.supabase.co")
+
+    # BYOK persisted keys: Fernet key (urlsafe base64, 32 bytes) used to encrypt
+    # saved provider API keys at rest. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # If empty, SESSION-ONLY BYOK still works but SAVING keys is disabled.
+    credentials_encryption_key: str = Field(default="", description="Fernet key for encrypting saved API keys")
 
     class Config:
         env_file = ".env"

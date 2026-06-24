@@ -12,6 +12,8 @@ import TablesPanel from "@/components/pdf/TablesPanel";
 import MultiChatPanel from "@/components/pdf/MultiChatPanel";
 import ComparePanel from "@/components/pdf/ComparePanel";
 import { listDocuments, deleteDocument } from "@/lib/api";
+import ApiKeyDialog from "@/components/byok/ApiKeyDialog";
+import { hasChosen } from "@/lib/byok";
 import { toast } from "@/components/ui/toaster";
 
 export default function Dashboard() {
@@ -22,12 +24,18 @@ export default function Dashboard() {
   const [showUpload, setShowUpload] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [keysOpen, setKeysOpen] = useState(false);
 
   const { data: documents = [] } = useQuery({
     queryKey: ["documents"],
     queryFn: listDocuments,
     refetchInterval: selectedDoc ? false : 10_000,
   });
+
+  // Post-login: prompt for AI provider/keys once per session if not chosen yet.
+  useEffect(() => {
+    if (!hasChosen()) setKeysOpen(true);
+  }, []);
 
   // Auto-select first doc
   useEffect(() => {
@@ -91,6 +99,7 @@ export default function Dashboard() {
         <Header
           document={!showUpload ? selectedDoc : null}
           onMenuClick={() => setSidebarOpen(true)}
+          onOpenKeys={() => setKeysOpen(true)}
         />
 
         {showUpload || !selectedDoc ? (
@@ -174,6 +183,8 @@ export default function Dashboard() {
           </Tabs>
         )}
       </div>
+
+      <ApiKeyDialog open={keysOpen} onClose={() => setKeysOpen(false)} />
     </div>
   );
 }

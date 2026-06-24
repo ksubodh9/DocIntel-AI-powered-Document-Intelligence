@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { supabase, supabaseConfigured } from "@/lib/supabase";
+import { clear as clearByok } from "@/lib/byok";
 
 const AuthContext = createContext(null);
 
@@ -45,7 +46,10 @@ export function AuthProvider({ children }) {
       options: { data: { full_name: fullName } },
     });
 
-  const signOut = () => supabase.auth.signOut();
+  const signOut = () => {
+    clearByok();   // drop any BYOK choice / session key on logout
+    return supabase.auth.signOut();
+  };
 
   return (
     <AuthContext.Provider value={{ user, loading, isAdmin, signIn, signUp, signOut }}>

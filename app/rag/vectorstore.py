@@ -22,6 +22,35 @@ from app.rag.chunker import TextChunk
 settings = get_settings()
 
 
+def _apply_rerank(query: str, chunks: list[dict], top_k: int) -> list[dict]:
+    """
+    Reorder candidate chunks with the cross-encoder reranker and keep the best
+    `top_k`. Each chunk keeps its original cosine `relevance_score` (so the
+    downstream `min_relevance_score` filter is unchanged) and gains a
+    `rerank_score`. Returns chunks ordered by `rerank_score` descending.
+
+    If the reranker fails to load or score for any reason, we fall back to the
+    cosine ordering already on the chunks — retrieval must never hard-fail just
+    because reranking is unavailable.
+    """
+    if not chunks:
+        return chunks
+    try:
+        from app.rag.reranker import get_reranker
+
+        scores = get_reranker().rerank(query, [c["text"] for c in chunks])
+        for c, s in zip(chunks, scores):
+            c["rerank_score"] = round(float(s), 4)
+        chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+        logger.info(
+            f"[VectorStore] Reranked {len(chunks)} candidates "
+            f"(top rerank_score={chunks[0]['rerank_score']:.3f}), keeping top {top_k}"
+        )
+    except Exception as e:
+        logger.warning(f"[VectorStore] Rerank failed ({e}); falling back to cosine order")
+    return chunks[:top_k]
+
+
 @lru_cache(maxsize=1)
 def get_chroma_client() -> chromadb.PersistentClient:
     """Singleton ChromaDB client backed by disk."""
@@ -111,10 +140,14 @@ def retrieve_chunks(
     if collection.count() == 0:
         return []
 
+    # When reranking is on, over-fetch a larger candidate pool so the
+    # cross-encoder has more to reorder, then truncate back to top_k below.
+    n_fetch = settings.rerank_candidates if settings.rerank_enabled else top_k
+
     query_embedding = embedding_model.embed_query(query)
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=min(top_k, collection.count()),
+        n_results=min(n_fetch, collection.count()),
         include=["documents", "metadatas", "distances"],
     )
 
@@ -137,6 +170,10 @@ def retrieve_chunks(
     # Sort by relevance (ascending distance = more similar)
     chunks.sort(key=lambda x: x["distance"])
     logger.info(f"[VectorStore] Retrieved {len(chunks)} chunks for query (top score={chunks[0]['relevance_score'] if chunks else 0:.3f})")
+
+    # Second stage: reorder the candidate pool with the cross-encoder and keep top_k.
+    if settings.rerank_enabled:
+        return _apply_rerank(query, chunks, top_k)
     return chunks
 
 
@@ -159,6 +196,10 @@ def retrieve_chunks_multi(
             all_chunks.extend(chunks)
         except Exception as e:
             logger.warning(f"[VectorStore] Failed to retrieve from doc {doc_id}: {e}")
-    # Global re-rank by relevance score, keep top_k
+
+    # Order the merged pool. When reranking is on, score the whole pool with the
+    # cross-encoder (a true cross-document rerank); otherwise sort by cosine.
+    if settings.rerank_enabled:
+        return _apply_rerank(query, all_chunks, top_k)
     all_chunks.sort(key=lambda x: x["relevance_score"], reverse=True)
     return all_chunks[:top_k]
