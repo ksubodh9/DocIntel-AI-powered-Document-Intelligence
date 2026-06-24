@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { cn, formatRelative, formatBytes } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
+import { useFeedback } from "@/contexts/FeedbackContext";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { getInitials } from "@/lib/utils";
@@ -22,11 +23,15 @@ export default function Sidebar({
   onClose,
 }) {
   const { user, signOut } = useAuth();
+  const { requestFeedback } = useFeedback();
   const navigate = useNavigate();
   const location = useLocation();
   const [hoveredId, setHoveredId] = useState(null);
 
   const handleSignOut = async () => {
+    // Ask engaged users for feedback before tearing down the session.
+    // Resolves immediately if they're not eligible (no nagging).
+    await requestFeedback("logout");
     await signOut();
     navigate("/login");
   };

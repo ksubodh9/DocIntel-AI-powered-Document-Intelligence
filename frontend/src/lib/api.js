@@ -43,6 +43,28 @@ client.interceptors.response.use(
   }
 );
 
+// ── Engagement tracking ─────────────────────────────────────────────────────
+// Records that the user actually used a feature this session. The feedback
+// prompt only fires for engaged users, so people who just bounce are never
+// nagged. Stored in sessionStorage (cleared when the tab closes).
+const ENGAGED_KEY = "docintel_engaged_feature";
+
+export function markEngaged(feature) {
+  try {
+    sessionStorage.setItem(ENGAGED_KEY, feature || "1");
+  } catch {
+    /* storage unavailable (private mode) — non-fatal */
+  }
+}
+
+export function getEngagement() {
+  try {
+    return sessionStorage.getItem(ENGAGED_KEY);
+  } catch {
+    return null;
+  }
+}
+
 // ── Documents ─────────────────────────────────────────────────────────────────
 
 export async function uploadDocument(file, onProgress) {
@@ -52,6 +74,7 @@ export async function uploadDocument(file, onProgress) {
     timeout: 600_000,
     onUploadProgress: (e) => onProgress?.(Math.round((e.loaded / e.total) * 30)),
   });
+  markEngaged("upload");
   return data;
 }
 
@@ -73,21 +96,25 @@ export async function deleteDocument(docId) {
 
 export async function classifyDocument(docId) {
   const { data } = await client.post(`/classify/${docId}`, {}, { timeout: 120_000 });
+  markEngaged("classify");
   return data;
 }
 
 export async function summarizeDocument(docId) {
   const { data } = await client.post(`/summarize/${docId}`, {}, { timeout: 300_000 });
+  markEngaged("summarize");
   return data;
 }
 
 export async function extractMetadata(docId) {
   const { data } = await client.post(`/metadata/${docId}`, {}, { timeout: 120_000 });
+  markEngaged("metadata");
   return data;
 }
 
 export async function getTables(docId) {
   const { data } = await client.get(`/tables/${docId}`, { timeout: 60_000 });
+  markEngaged("tables");
   return data;
 }
 
@@ -102,6 +129,7 @@ export async function chat(docId, message, includeHistory = true) {
   const { data } = await client.post("/chat", {
     document_id: docId, message, include_history: includeHistory,
   }, { timeout: 180_000 });
+  markEngaged("chat");
   return data;
 }
 
@@ -109,6 +137,7 @@ export async function multiChat(docIds, message) {
   const { data } = await client.post("/chat/multi", {
     document_ids: docIds, message,
   }, { timeout: 180_000 });
+  markEngaged("chat_multi");
   return data;
 }
 
@@ -116,6 +145,24 @@ export async function compareDocuments(docIdA, docIdB) {
   const { data } = await client.post("/compare", {
     document_id_a: docIdA, document_id_b: docIdB,
   }, { timeout: 240_000 });
+  markEngaged("compare");
+  return data;
+}
+
+// ── Feedback ──────────────────────────────────────────────────────────────────
+
+export async function submitFeedback({ rating, comment, route, lastFeature }) {
+  const { data } = await client.post("/feedback", {
+    rating: rating ?? null,
+    comment: comment || null,
+    route: route || null,
+    last_feature_used: lastFeature || null,
+  }, { timeout: 20_000 });
+  return data;
+}
+
+export async function getAdminFeedback() {
+  const { data } = await client.get("/admin/feedback");
   return data;
 }
 

@@ -35,8 +35,10 @@ from app.services.llm_service import get_llm_service, LLMService, LLMError, LLMC
 from app.services.credential_service import CredentialService, UnsupportedProviderError
 from app.services.document_service import DocumentService
 from app.rag.vectorstore import delete_collection
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_optional_user
 from app.models.usage import UsageEvent
+from app.models.feedback import Feedback
+from app.schemas.feedback import FeedbackCreate, FeedbackResponse
 from app.schemas.document import (
     UploadResponse,
     ClassifyResponse,
@@ -555,6 +557,38 @@ def delete_document(
     # Delete from DB (cascades to chat messages)
     svc.db.delete(doc)
     svc.db.commit()
+
+
+# ── Feedback ──────────────────────────────────────────────────────────────────
+
+@router.post("/feedback", response_model=FeedbackResponse, status_code=201)
+def submit_feedback(
+    payload: FeedbackCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """
+    Capture general product feedback (rating and/or comment).
+
+    Authentication is optional — the prompt may fire while a session is being
+    torn down on logout, so we accept anonymous submissions rather than 401.
+    """
+    comment = (payload.comment or "").strip() or None
+    fb = Feedback(
+        user_id=user.get("user_id") if user else None,
+        email=user.get("email") if user else None,
+        category=payload.category or "general",
+        rating=payload.rating,
+        comment=comment,
+        route=payload.route,
+        last_feature_used=payload.last_feature_used,
+        user_agent=(request.headers.get("user-agent") or "")[:512] or None,
+    )
+    db.add(fb)
+    db.commit()
+    db.refresh(fb)
+    return FeedbackResponse(id=fb.id, status=fb.status)
 
 
 

@@ -102,6 +102,30 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_document_id ON public.usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_created    ON public.usage_events (created_at DESC);
 
 -- =============================================================================
+-- feedback
+-- General product feedback. The form collects only rating + comment; category
+-- is retained (default 'general') for future triage. Written by the backend
+-- (service role), so RLS below is a safety net rather than the primary path.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.feedback (
+    id                UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id           UUID        REFERENCES auth.users(id) ON DELETE SET NULL,
+    email             TEXT,
+    category          TEXT        NOT NULL DEFAULT 'general',  -- general | bug | idea
+    rating            INTEGER     CHECK (rating BETWEEN 1 AND 5),
+    comment           TEXT,
+    route             TEXT,
+    last_feature_used TEXT,
+    user_agent        TEXT,
+    status            TEXT        NOT NULL DEFAULT 'new',       -- new | reviewed
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON public.feedback (user_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON public.feedback (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_status  ON public.feedback (status);
+
+-- =============================================================================
 -- Row Level Security (RLS)
 -- Users can only read/write their own rows.
 -- Service role (backend) bypasses RLS automatically.
@@ -110,6 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_created    ON public.usage_events (c
 ALTER TABLE public.documents     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.usage_events  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.feedback      ENABLE ROW LEVEL SECURITY;
 
 -- Documents: owner full access
 CREATE POLICY "docs_owner_select" ON public.documents
@@ -141,6 +166,14 @@ CREATE POLICY "chat_owner_insert" ON public.chat_messages
 
 -- Usage events: users see only their own
 CREATE POLICY "usage_owner_select" ON public.usage_events
+    FOR SELECT USING (auth.uid() = user_id);
+
+-- Feedback: users may insert their own rows and read them back. Admin/service
+-- role reads everything (bypasses RLS). Anonymous submissions go via the backend.
+CREATE POLICY "feedback_owner_insert" ON public.feedback
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "feedback_owner_select" ON public.feedback
     FOR SELECT USING (auth.uid() = user_id);
 
 -- =============================================================================

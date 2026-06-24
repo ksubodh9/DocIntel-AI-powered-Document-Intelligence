@@ -20,6 +20,8 @@ from app.database.base import get_db
 from app.middleware.auth import require_admin
 from app.models.document import Document
 from app.models.usage import UsageEvent
+from app.models.feedback import Feedback
+from app.schemas.feedback import AdminFeedbackItem
 from app.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -68,13 +70,36 @@ def get_stats(
     # Unique users
     total_users = db.query(func.count(func.distinct(Document.user_id))).scalar() or 0
 
+    # Feedback metrics
+    total_feedback = db.query(func.count(Feedback.id)).scalar() or 0
+    new_feedback = db.query(func.count(Feedback.id)).filter(Feedback.status == "new").scalar() or 0
+    avg_rating = db.query(func.avg(Feedback.rating)).filter(Feedback.rating.isnot(None)).scalar()
+
     return {
         "total_users": total_users,
         "total_documents": total_docs,
         "docs_indexed": docs_indexed,
         "total_api_calls": total_calls,
         "storage_used_bytes": int(storage_bytes),
+        "total_feedback": total_feedback,
+        "new_feedback": new_feedback,
+        "avg_rating": round(float(avg_rating), 2) if avg_rating is not None else None,
     }
+
+
+@router.get("/feedback", response_model=list[AdminFeedbackItem])
+def list_feedback(
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
+    """Most recent product feedback, newest first."""
+    rows = (
+        db.query(Feedback)
+        .order_by(Feedback.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    return [AdminFeedbackItem.model_validate(r) for r in rows]
 
 
 @router.get("/users")

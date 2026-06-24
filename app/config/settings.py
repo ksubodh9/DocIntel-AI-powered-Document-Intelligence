@@ -126,6 +126,9 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = False
+        # The shared .env also holds frontend-only keys (VITE_*) and other
+        # tooling vars. Ignore anything not declared above instead of crashing.
+        extra = "ignore"
 
 
 @lru_cache()

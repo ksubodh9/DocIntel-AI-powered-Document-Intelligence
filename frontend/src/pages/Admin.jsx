@@ -3,13 +3,14 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import {
   Users, FileText, Activity, HardDrive,
-  ArrowLeft, ChevronRight, ChevronDown, Loader2
+  ArrowLeft, ChevronRight, ChevronDown, Loader2,
+  MessageSquare, Star
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { getAdminStats, getAdminUsers, getAdminUserDocuments } from "@/lib/api";
+import { getAdminStats, getAdminUsers, getAdminUserDocuments, getAdminFeedback } from "@/lib/api";
 import { formatDate, formatRelative, formatBytes, getInitials } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
@@ -32,6 +33,76 @@ function StatCard({ icon: Icon, label, value, sub, color = "indigo" }) {
           <p className="text-sm text-slate-500 dark:text-slate-400">{label}</p>
           {sub && <p className="text-xs text-slate-400 dark:text-slate-500">{sub}</p>}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Stars({ value = 0 }) {
+  if (!value) return <span className="text-xs text-slate-400 dark:text-slate-500">No rating</span>;
+  return (
+    <span className="inline-flex items-center gap-0.5">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <Star
+          key={n}
+          className={n <= value
+            ? "h-3.5 w-3.5 fill-amber-400 text-amber-400"
+            : "h-3.5 w-3.5 text-slate-300 dark:text-slate-600"}
+        />
+      ))}
+    </span>
+  );
+}
+
+function FeedbackSection({ feedback, isLoading, stats }) {
+  return (
+    <Card className="mt-6">
+      <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
+        <CardTitle className="text-sm">Feedback ({stats?.total_feedback ?? feedback.length})</CardTitle>
+        <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+          {stats?.avg_rating != null && (
+            <span className="inline-flex items-center gap-1">
+              <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+              {stats.avg_rating} avg
+            </span>
+          )}
+          {stats?.new_feedback > 0 && (
+            <Badge variant="indigo" className="text-[10px]">{stats.new_feedback} new</Badge>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        {isLoading ? (
+          <div className="flex items-center justify-center gap-2 py-10 text-slate-400 dark:text-slate-500">
+            <Loader2 className="h-4 w-4 animate-spin" /><span className="text-sm">Loading feedback...</span>
+          </div>
+        ) : feedback.length === 0 ? (
+          <p className="px-4 py-8 text-center text-sm text-slate-400 dark:text-slate-500">No feedback yet.</p>
+        ) : (
+          <div className="divide-y dark:divide-slate-800">
+            {feedback.map((f) => (
+              <div key={f.id} className="px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <Stars value={f.rating} />
+                    <span className="truncate text-xs text-slate-500 dark:text-slate-400">
+                      {f.email || "anonymous"}
+                    </span>
+                  </div>
+                  <span className="shrink-0 text-xs text-slate-400 dark:text-slate-500">
+                    {f.created_at ? formatRelative(f.created_at) : ""}
+                  </span>
+                </div>
+                {f.comment && (
+                  <p className="mt-1.5 text-sm text-slate-700 dark:text-slate-300">{f.comment}</p>
+                )}
+                {f.last_feature_used && (
+                  <Badge variant="secondary" className="mt-2 text-[9px]">{f.last_feature_used}</Badge>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -107,6 +178,7 @@ export default function Admin() {
 
   const { data: stats } = useQuery({ queryKey: ["admin-stats"], queryFn: getAdminStats });
   const { data: users = [], isLoading: usersLoading } = useQuery({ queryKey: ["admin-users"], queryFn: getAdminUsers });
+  const { data: feedback = [], isLoading: feedbackLoading } = useQuery({ queryKey: ["admin-feedback"], queryFn: getAdminFeedback });
 
   const toggleExpand = (id) => setExpandedUser((e) => (e === id ? null : id));
 
@@ -207,6 +279,9 @@ export default function Admin() {
             )}
           </CardContent>
         </Card>
+
+        {/* Feedback */}
+        <FeedbackSection feedback={feedback} isLoading={feedbackLoading} stats={stats} />
       </div>
     </div>
   );
