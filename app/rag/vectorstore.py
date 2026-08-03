@@ -61,12 +61,23 @@ def get_chroma_client() -> chromadb.PersistentClient:
 
 
 def get_or_create_collection(doc_id: str) -> chromadb.Collection:
-    """Get or create a ChromaDB collection for a document."""
+    """
+    Get or create a ChromaDB collection for a document.
+
+    The collection metadata records the embedding model that produced its
+    vectors. Query and document vectors must come from the *same* model or
+    cosine similarity is meaningless — this stamp lets `retrieve_chunks` detect
+    a stale index built by a previous model (see the embedding-model migration).
+    """
     client = get_chroma_client()
     collection_name = f"doc_{doc_id}"
     return client.get_or_create_collection(
         name=collection_name,
-        metadata={"doc_id": doc_id, "hnsw:space": "cosine"},
+        metadata={
+            "doc_id": doc_id,
+            "hnsw:space": "cosine",
+            "embedding_model": settings.embedding_model,
+        },
     )
 
 
@@ -139,6 +150,18 @@ def retrieve_chunks(
     # Guard: collection must have documents
     if collection.count() == 0:
         return []
+
+    # Guard: the vectors in this collection must have been produced by the same
+    # model we're about to query with. A mismatch (or a missing stamp, meaning
+    # the collection predates model stamping) means cosine scores will be noise
+    # and every answer collapses to "not found". Warn loudly so it's diagnosable.
+    indexed_model = (collection.metadata or {}).get("embedding_model")
+    if indexed_model and indexed_model != settings.embedding_model:
+        logger.warning(
+            f"[VectorStore] STALE INDEX for doc {doc_id}: vectors were built with "
+            f"'{indexed_model}' but the current model is '{settings.embedding_model}'. "
+            f"Retrieval scores will be unreliable — re-index with scripts/reindex.py."
+        )
 
     # When reranking is on, over-fetch a larger candidate pool so the
     # cross-encoder has more to reorder, then truncate back to top_k below.

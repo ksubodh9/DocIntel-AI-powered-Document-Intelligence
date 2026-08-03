@@ -210,6 +210,49 @@ async def startup():
 
     threading.Thread(target=_warm_embeddings, daemon=True).start()
 
+    def _check_stale_index():
+        """
+        Warn if any ready document's vectors were built by a different embedding
+        model than the one currently configured. A mismatch makes retrieval
+        scores meaningless and collapses every chat answer to "not found".
+        Runs off the request path; never crashes startup.
+        """
+        try:
+            from app.database.base import SessionLocal
+            from app.models.document import Document
+            from app.rag.vectorstore import get_chroma_client
+
+            client = get_chroma_client()
+            db = SessionLocal()
+            try:
+                docs = db.query(Document).filter(Document.status == "ready").all()
+            finally:
+                db.close()
+
+            stale = 0
+            for doc in docs:
+                try:
+                    col = client.get_collection(f"doc_{doc.id}")
+                    indexed = (col.metadata or {}).get("embedding_model")
+                except Exception:
+                    continue  # no collection for this doc — unrelated problem
+                if indexed != settings.embedding_model:
+                    stale += 1
+
+            if stale:
+                logger.warning(
+                    f"[StaleIndex] {stale}/{len(docs)} ready document(s) were indexed "
+                    f"with a different embedding model than '{settings.embedding_model}'. "
+                    f"Chat on those documents will return 'not found'. "
+                    f"Fix: python scripts/reindex.py --stale-only"
+                )
+            elif docs:
+                logger.info(f"[StaleIndex] All {len(docs)} ready document(s) match the current embedding model.")
+        except Exception as e:
+            logger.warning(f"[StaleIndex] Check skipped: {e}")
+
+    threading.Thread(target=_check_stale_index, daemon=True).start()
+
     if settings.llm_provider == "ollama":
         from app.utils.ollama_utils import is_ollama_running, get_ollama_base_url, is_model_available
         base_url = get_ollama_base_url(settings.ollama_host, settings.ollama_port)
