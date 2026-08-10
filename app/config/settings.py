@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_device: str = "cpu"  # cpu | cuda
+    # Vector dimension of the embedding model above. MUST match the model:
+    #   BAAI/bge-small-en-v1.5           -> 384
+    #   text-embedding-3-small (OpenAI)  -> 1536
+    # This sizes the pgvector column. Changing the model to a different
+    # dimension requires updating this AND re-indexing (scripts/reindex.py).
+    embedding_dim: int = 384
 
     # Storage
     upload_dir: Path = BASE_DIR / "data" / "uploads"
