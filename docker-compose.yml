@@ -27,7 +27,10 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:////app/data/db/pdf_agent.db
+      # DATABASE_URL is read from .env (Supabase Postgres + pgvector). Do NOT
+      # hardcode SQLite here: the vector store requires Postgres/pgvector
+      # (see app/rag/vectorstore.py). A value in `environment:` would override
+      # the one in `env_file:`, which is what forced SQLite before.
       - OLLAMA_HOST=host.docker.internal
       - OLLAMA_PORT=11434
       - OMP_NUM_THREADS=2
