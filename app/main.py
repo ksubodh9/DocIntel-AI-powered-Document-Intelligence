@@ -110,7 +110,17 @@ app.add_middleware(
     allow_origin_regex=_CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    # BYOK sends per-request LLM credential headers (see frontend src/lib/byok.js).
+    # These MUST be allowed or the browser preflight (OPTIONS) fails with 400 and
+    # every call surfaces to the client as a generic "Network Error".
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-LLM-Use-Default",
+        "X-LLM-Provider",
+        "X-LLM-Api-Key",
+        "X-LLM-Model",
+    ],
 )
 
 

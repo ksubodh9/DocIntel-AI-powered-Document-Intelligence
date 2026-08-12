@@ -45,7 +45,16 @@ class BGEEmbeddings:
         self.model_name = model_name
         # device is accepted for interface compatibility; fastembed runs on CPU
         # via onnxruntime. Install fastembed-gpu to use a GPU.
-        self.model = TextEmbedding(model_name=model_name)
+        #
+        # Pin the cache to an explicit dir when configured (EMBEDDING_CACHE_DIR).
+        # In Docker this points at the model baked into the image at build time,
+        # so there's no runtime download to interrupt (the cause of the
+        # "model_optimized.onnx File doesn't exist" partial-cache failure).
+        cache_dir = (settings.embedding_cache_dir or "").strip() or None
+        if cache_dir:
+            self.model = TextEmbedding(model_name=model_name, cache_dir=cache_dir)
+        else:
+            self.model = TextEmbedding(model_name=model_name)
         self._is_bge = "bge" in model_name.lower()
         _log.info(f"[Embeddings] Model '{model_name}' loaded successfully.")
 

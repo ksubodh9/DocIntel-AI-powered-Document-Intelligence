@@ -259,13 +259,14 @@ class LLMService:
         system_prompt: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: int = 2048,
+        json_mode: bool = False,
     ) -> str:
         chain = self._build_chain()
         last_error: Optional[LLMError] = None
 
         for provider in chain:
             try:
-                result = self._call_provider(provider, prompt, system_prompt, temperature, max_tokens)
+                result = self._call_provider(provider, prompt, system_prompt, temperature, max_tokens, json_mode)
                 if provider != self.provider:
                     logger.warning(f"[LLM] Fell back to {provider} (primary={self.provider})")
                 return result
@@ -278,8 +279,18 @@ class LLMService:
 
         raise last_error or LLMError("All providers in fallback chain failed.")
 
-    def complete_json(self, prompt: str, system_prompt: Optional[str] = None) -> dict:
-        raw = self.complete(prompt, system_prompt, temperature=0.0)
+    def complete_json(self, prompt: str, system_prompt: Optional[str] = None,
+                      max_tokens: int = 8192) -> dict:
+        # JSON payloads here are small, but gemini-2.5 "thinking" models spend
+        # part of max_output_tokens on hidden reasoning. With the old 2048 cap
+        # the reasoning could eat the whole budget and the visible JSON was cut
+        # off mid-structure (finish_reason=MAX_TOKENS) → parse failure → 502.
+        # A generous cap leaves room for both; small outputs never approach it.
+        # json_mode=True asks providers that support it (groq/openai/gemini) to
+        # return raw, valid JSON — no markdown fences, no trailing prose, no
+        # half-formed objects — which is what previously broke the parser.
+        raw = self.complete(prompt, system_prompt, temperature=0.0,
+                            max_tokens=max_tokens, json_mode=True)
         return extract_json(raw)
 
     # -------------------------------------------------------------------------
@@ -296,12 +307,12 @@ class LLMService:
 
     def _call_provider(
         self, provider: str, prompt: str, system_prompt: Optional[str],
-        temperature: float, max_tokens: int,
+        temperature: float, max_tokens: int, json_mode: bool = False,
     ) -> str:
         if provider not in ALLOWED_PROVIDERS:
             raise LLMError(f"Unknown provider '{provider}'. Check LLM_PROVIDER in .env.")
 
-        logger.info(f"[LLM] Provider={provider}  temp={temperature}  max_tokens={max_tokens}")
+        logger.info(f"[LLM] Provider={provider}  temp={temperature}  max_tokens={max_tokens}  json_mode={json_mode}")
         if system_prompt:
             logger.info(f"[LLM] System ({len(system_prompt)} chars): {system_prompt[:200]}")
         logger.info(f"[LLM] Prompt ({len(prompt)} chars): {prompt[:400]}")
@@ -309,15 +320,15 @@ class LLMService:
         t0 = time.perf_counter()
         try:
             if provider == "gemini":
-                result = self._gemini_complete(prompt, system_prompt, temperature, max_tokens)
+                result = self._gemini_complete(prompt, system_prompt, temperature, max_tokens, json_mode)
             elif provider == "ollama":
                 result = self._ollama_complete(prompt, system_prompt, temperature, max_tokens)
             elif provider == "groq":
-                result = self._groq_complete(prompt, system_prompt, temperature, max_tokens)
+                result = self._groq_complete(prompt, system_prompt, temperature, max_tokens, json_mode)
             elif provider == "huggingface":
                 result = self._huggingface_complete(prompt, system_prompt, temperature, max_tokens)
             elif provider == "openai":
-                result = self._openai_complete(prompt, system_prompt, temperature, max_tokens)
+                result = self._openai_complete(prompt, system_prompt, temperature, max_tokens, json_mode)
             elif provider == "anthropic":
                 result = self._anthropic_complete(prompt, system_prompt, temperature, max_tokens)
             else:  # pragma: no cover - guarded above
@@ -335,9 +346,15 @@ class LLMService:
     # Provider implementations
     # -------------------------------------------------------------------------
 
-    def _gemini_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
+    def _gemini_complete(self, prompt, system_prompt, temperature, max_tokens, json_mode=False) -> str:
         import google.generativeai as genai
         genai.configure(api_key=self.cfg.key_for("gemini"))
+
+        gen_config = {"temperature": temperature, "max_output_tokens": max_tokens}
+        # Native JSON output: Gemini returns raw application/json (no ``` fences),
+        # so the response is always parseable.
+        if json_mode:
+            gen_config["response_mime_type"] = "application/json"
 
         models = self.cfg.models_for("gemini")
         last_err: Optional[LLMError] = None
@@ -350,8 +367,22 @@ class LLMService:
                 )
                 response = model.generate_content(
                     prompt,
-                    generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+                    generation_config=gen_config,
                 )
+                # gemini-2.5 thinking models can exhaust max_output_tokens on
+                # hidden reasoning and return truncated text. Detect that and log
+                # it loudly instead of silently handing a half-formed answer (or a
+                # truncated JSON object) to the caller.
+                try:
+                    fr = response.candidates[0].finish_reason
+                    if getattr(fr, "name", str(fr)) == "MAX_TOKENS":
+                        logger.warning(
+                            f"[Gemini] {model_name} hit MAX_TOKENS — output was "
+                            f"truncated (thinking budget consumed the cap). "
+                            f"Increase max_output_tokens."
+                        )
+                except (AttributeError, IndexError):
+                    pass
                 return response.text.strip()
             except Exception as e:
                 err = _classify_api_error("gemini", e)
@@ -402,7 +433,7 @@ class LLMService:
                 raise _classify_api_error("ollama", e) from e
         raise LLMError(f"Ollama failed after 3 attempts: {last_error}")
 
-    def _groq_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
+    def _groq_complete(self, prompt, system_prompt, temperature, max_tokens, json_mode=False) -> str:
         from groq import Groq
 
         models = self.cfg.models_for("groq")
@@ -412,13 +443,24 @@ class LLMService:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        # OpenAI-compatible JSON mode forces valid, unfenced JSON. Groq requires
+        # the word "json" to appear in the messages when this is on; the
+        # extraction prompts already ask for JSON, but add a system nudge to be
+        # safe (and to satisfy that requirement even for terse prompts).
+        extra = {}
+        if json_mode:
+            extra["response_format"] = {"type": "json_object"}
+            messages.insert(0, {"role": "system",
+                                "content": "Respond with a single valid JSON object and nothing else."})
+
         last_err: Optional[LLMError] = None
         for model_name in models:
             try:
-                logger.info(f"[Groq] Trying model: {model_name}")
+                logger.info(f"[Groq] Trying model: {model_name}  json_mode={json_mode}")
                 response = client.chat.completions.create(
                     model=model_name, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
+                    **extra,
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
@@ -444,19 +486,21 @@ class LLMService:
                                           temperature=max(temperature, 0.01))
         return response.choices[0].message.content.strip()
 
-    def _openai_complete(self, prompt, system_prompt, temperature, max_tokens) -> str:
+    def _openai_complete(self, prompt, system_prompt, temperature, max_tokens, json_mode=False) -> str:
         from openai import OpenAI
         model = self.cfg.models.get("openai") or "gpt-4o-mini"
-        logger.info(f"[OpenAI] Model: {model}")
+        logger.info(f"[OpenAI] Model: {model}  json_mode={json_mode}")
         client = OpenAI(api_key=self.cfg.key_for("openai"))
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
+        extra = {"response_format": {"type": "json_object"}} if json_mode else {}
         try:
             response = client.chat.completions.create(
                 model=model, messages=messages,
                 temperature=temperature, max_tokens=max_tokens,
+                **extra,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -489,6 +533,15 @@ def extract_json(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    # Strip markdown fences even when the closing ``` is missing (a truncated
+    # response opens with ```json but never closes it), then retry.
+    unfenced = re.sub(r"^\s*```(?:json)?\s*", "", text)
+    unfenced = re.sub(r"\s*```\s*$", "", unfenced).strip()
+    if unfenced != text.strip():
+        try:
+            return json.loads(unfenced)
+        except json.JSONDecodeError:
+            pass
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         try:

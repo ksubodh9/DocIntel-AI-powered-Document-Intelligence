@@ -1,0 +1,30 @@
+# Local development overrides — applied automatically by `docker compose up`.
+#
+# Why this exists
+# ---------------
+# The main Dockerfile bakes the source in with `COPY . .`, so a plain
+# `docker compose up` runs whatever code was present at *build* time. Editing a
+# .py file then does nothing until you rebuild the image — the trap that made
+# an already-fixed bug look unfixed.
+#
+# This override bind-mounts the source over the image and starts uvicorn with
+# --reload, so Python changes take effect on save with no rebuild.
+#
+# It is DEV ONLY. Compose loads docker-compose.yml + docker-compose.override.yml
+# together by default. For a production-style run that ignores this file:
+#
+#     docker compose -f docker-compose.yml up -d --build
+#
+services:
+  backend:
+    volumes:
+      # Live-mount source over the baked-in copy. Data mounts from the base
+      # file (uploads/vectorstore/db) still apply — Compose appends these.
+      - ./app:/app/app
+      - ./scripts:/app/scripts
+    # --reload-dir limits the watcher to source dirs so it doesn't churn on
+    # data/ writes (uploads, vectorstore) during normal use.
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0 --port 8000
+      --reload --reload-dir /app/app --reload-dir /app/scripts

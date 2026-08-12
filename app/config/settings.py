@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     # Comma-separated Gemini models tried in order (rate-limit fallback within Gemini)
     # Valid names: gemini-2.5-flash, gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash-lite"  # gemini-2.0-* shut down 2026-06-01
     gemini_models: str = Field(default="", description="Comma-separated Gemini model names to try in order")
     anthropic_model: str = "claude-3-haiku-20240307"
     groq_model: str = "llama-3.1-8b-instant"
@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_device: str = "cpu"  # cpu | cuda
+    # Where fastembed stores the downloaded ONNX model. Empty = fastembed's
+    # default (a temp dir like /tmp/fastembed_cache, which is ephemeral and
+    # re-downloads on every container rebuild — and can be left half-written if
+    # a restart interrupts the download). In Docker this is set to a path that
+    # is baked into the image at build time (see Dockerfile), so the model is
+    # present before the app ever starts. Env: EMBEDDING_CACHE_DIR.
+    embedding_cache_dir: str = ""
     # Vector dimension of the embedding model above. MUST match the model:
     #   BAAI/bge-small-en-v1.5           -> 384
     #   text-embedding-3-small (OpenAI)  -> 1536

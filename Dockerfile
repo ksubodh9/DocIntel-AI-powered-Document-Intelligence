@@ -26,6 +26,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
     pip install --retries 5 --timeout 120 -r requirements.txt
 
+# Pre-download the embedding model into the image at BUILD time, into a fixed
+# cache dir. This runs after pip install (so fastembed is available) but before
+# copying source, so the ~130 MB download is cached as its own layer and only
+# re-runs when this line or the base deps change — not on every code edit.
+# Baking it in means the container never downloads at runtime, so a restart /
+# --reload can no longer interrupt a download and leave a half-written model
+# (the "model_optimized.onnx File doesn't exist" failure). Same fastembed
+# version builds and runs it, so the expected ONNX filename always matches.
+ENV EMBEDDING_CACHE_DIR=/app/.fastembed_cache
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/app/.fastembed_cache')"
+
 # Copy source
 COPY . .
 
